@@ -1,0 +1,15 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "d:\\1 Software\\Projects\\Crystal\\logs\\.32f855ba4ea22e3e9d9db089906bd7aa59317f79-audit.json",
+    "files": [
+        {
+            "date": 1780070922234,
+            "name": "d:\\1 Software\\Projects\\Crystal\\logs\\mcp-puppeteer-2026-05-29.log",
+            "hash": "4ffea3e11f5b18a95ca5b87fbc61ae21c7879deb2c182cb201be5a8d016ecb58"
+        }
+    ],
+    "hashType": "sha256"
+}
