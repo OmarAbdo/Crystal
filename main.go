@@ -15,7 +15,14 @@ func main() {
 	if cfg.NodeID == 1 {
 		initialRole = Leader
 	}
-	raft := NewRaftNode(initialRole)
+	// Extract peer IDs for the tracking map
+	var peerIDs []int
+	for pid := range cfg.Peers {
+		peerIDs = append(peerIDs, pid)
+	}
+
+	// Pass the peer list to the tracking state machine
+	raft := NewRaftNode(initialRole, peerIDs)
 
 	// Pass both store and raft state down to our endpoints
 	http.HandleFunc("/set", HandleSet(store, raft, cfg))

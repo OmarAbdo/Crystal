@@ -1,10 +1,7 @@
 package main
 
-import (
-	"sync"
-)
+import "sync"
 
-// NodeRole represents the current consensus state of the node
 type NodeRole string
 
 const (
@@ -14,17 +11,28 @@ const (
 )
 
 type RaftNode struct {
-	mu        sync.RWMutex
-	Role      NodeRole
+	mu          sync.RWMutex
+	Role        NodeRole
 	CurrentTerm int
-	LeaderID  int // Tracks who the current active leader is
+	LeaderID    int
+
+	// Production tracking indices
+	CommitIndex int         // Highest log index known to be committed
+	MatchIndex  map[int]int // For each peer, the highest log index known to be replicated
 }
 
-func NewRaftNode(initialRole NodeRole) *RaftNode {
+func NewRaftNode(initialRole NodeRole, peerIDs []int) *RaftNode {
+	matches := make(map[int]int)
+	for _, pid := range peerIDs {
+		matches[pid] = 0
+	}
+
 	return &RaftNode{
 		Role:        initialRole,
 		CurrentTerm: 1,
-		LeaderID:    1, // Let's hardcode Node 1 as the initial leader for now
+		LeaderID:    1,
+		CommitIndex: 0,
+		MatchIndex:  matches,
 	}
 }
 
@@ -33,4 +41,13 @@ func (rn *RaftNode) IsLeader() bool {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
 	return rn.Role == Leader
+}
+
+// UpdatePeerProgress records how far a follower has come
+func (rn *RaftNode) UpdatePeerProgress(peerID int, index int) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if index > rn.MatchIndex[peerID] {
+		rn.MatchIndex[peerID] = index
+	}
 }

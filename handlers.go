@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 )
 
@@ -15,9 +16,8 @@ type KeyValueRequest struct {
 // HandleSet now validates if the current node is the cluster leader before modifying state
 func HandleSet(store *CrystalStore, raft *RaftNode, cfg *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// CRITICAL CHECK: If we are not the leader, reject the client's write!
 		if !raft.IsLeader() {
-			http.Error(w, fmt.Sprintf("Not the leader. Please send requests to Node %d", raft.LeaderID), http.StatusForbidden)
+			http.Error(w, fmt.Sprintf("Not the leader. Go to Node %d", raft.LeaderID), http.StatusForbidden)
 			return
 		}
 
@@ -32,12 +32,21 @@ func HandleSet(store *CrystalStore, raft *RaftNode, cfg *Config) http.HandlerFun
 			return
 		}
 
-		// 1. Log locally
+		// 1. Append to local log ONLY
 		entry := store.AppendToLog(req.Key, req.Value)
-		store.ApplyEntry(entry)
 
-		// 2. Replicate to peers
-		go store.ReplicateToPeers(cfg.Peers, entry)
+		// 2. Block and attempt to replicate to a majority of the cluster
+		quorumReached := store.ReplicateToPeers(cfg.Peers, entry)
+
+		if !quorumReached {
+			// In production, if we can't get quorum, we do NOT apply it to our state machine.
+			log.Printf("[API] Write failed - Quorum not reached for index %d", entry.Index)
+			http.Error(w, "Cluster write timeout: Quorum not reached", http.StatusServiceUnavailable)
+			return
+		}
+
+		// 3. Quorum secured! Now it is safe to apply to our memory store
+		store.ApplyEntry(entry)
 
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "OK\n")
