@@ -6,15 +6,19 @@ import (
 )
 
 func main() {
-	store := NewCrystalStore()
-	port := ":8080"
+	// 1. Parse who we are and who our neighbors are
+	cfg := ParseFlags()
 
-	// Registering handlers by passing our store instance down
+	store := NewCrystalStore()
+
 	http.HandleFunc("/set", HandleSet(store))
 	http.HandleFunc("/get", HandleGet(store))
 
-	log.Printf("[MAIN] Crystal node starting on port %s...", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
+	// 2. Start our server using the dynamic port from our config flags
+	log.Printf("[MAIN] Crystal Node %d starting on port %s...", cfg.NodeID, cfg.Port)
+	log.Printf("[MAIN] Tracked peers: %v", cfg.Peers)
+
+	if err := http.ListenAndServe(cfg.Port, nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

@@ -1,0 +1,4 @@
+current limitation in crystal.
+1. Nodes communicate with internal REST API endpoints. push system yes but sounds bad without events nor publishing.
+2. how we define nodes and let them know each other is done by a hardcoded manually written cmd line by us humans, this is too primitive
+3. everything is still only in memory on the receiving node.
