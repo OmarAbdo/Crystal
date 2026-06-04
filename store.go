@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
 	"sync"
+	"time"
 )
 
 type LogEntry struct {
@@ -55,4 +60,36 @@ func (cs *CrystalStore) Get(key string) (string, bool) {
 	defer cs.mu.RUnlock()
 	val, ok := cs.data[key]
 	return val, ok
+}
+
+// ReplicateToPeers forwards a log entry to all tracked peer nodes
+func (cs *CrystalStore) ReplicateToPeers(peers map[int]string, entry LogEntry) {
+	// Create an HTTP client with a quick timeout so we don't hang forever if a node is dead
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for peerID, peerAddr := range peers {
+		// Prepare the JSON payload
+		jsonData, err := json.Marshal(entry)
+		if err != nil {
+			log.Printf("[STORE] Failed to marshal entry for peer %d: %v", peerID, err)
+			continue
+		}
+
+		// Build the URL to the peer's internal endpoint
+		url := fmt.Sprintf("http://%s/internal/append", peerAddr)
+
+		// Send the log entry to the peer
+		resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			log.Printf("[STORE] Failed to send log to peer %d at %s: %v", peerID, peerAddr, err)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			log.Printf("[STORE] Successfully replicated index %d to peer %d", entry.Index, peerID)
+		} else {
+			log.Printf("[STORE] Peer %d rejected log index %d with status: %s", peerID, entry.Index, resp.Status)
+		}
+	}
 }

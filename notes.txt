@@ -1,4 +1,6 @@
 current limitation in crystal.
-1. Nodes communicate with internal REST API endpoints. push system yes but sounds bad without events nor publishing.
-2. how we define nodes and let them know each other is done by a hardcoded manually written cmd line by us humans, this is too primitive
-3. everything is still only in memory on the receiving node.
+1. Our WAL log is so far only in memory.
+2. how we define nodes and let them know each other is done by a hardcoded manually written cmd line by us humans.
+   this is too primitive way of cluster definition and service discovery.
+3. the /internal api is not really internal
+4. actually RAFT?

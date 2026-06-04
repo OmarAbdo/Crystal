@@ -6,18 +6,23 @@ import (
 )
 
 func main() {
-	// 1. Parse who we are and who our neighbors are
 	cfg := ParseFlags()
-
 	store := NewCrystalStore()
 
-	http.HandleFunc("/set", HandleSet(store))
+	// Initialize Raft State
+	// Default to Follower, but if ID is 1, make it the initial Leader
+	initialRole := Follower
+	if cfg.NodeID == 1 {
+		initialRole = Leader
+	}
+	raft := NewRaftNode(initialRole)
+
+	// Pass both store and raft state down to our endpoints
+	http.HandleFunc("/set", HandleSet(store, raft, cfg))
 	http.HandleFunc("/get", HandleGet(store))
+	http.HandleFunc("/internal/append", HandleInternalAppend(store))
 
-	// 2. Start our server using the dynamic port from our config flags
-	log.Printf("[MAIN] Crystal Node %d starting on port %s...", cfg.NodeID, cfg.Port)
-	log.Printf("[MAIN] Tracked peers: %v", cfg.Peers)
-
+	log.Printf("[MAIN] Crystal Node %d starting as %s on port %s...", cfg.NodeID, initialRole, cfg.Port)
 	if err := http.ListenAndServe(cfg.Port, nil); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
