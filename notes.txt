@@ -4,3 +4,11 @@ current limitation in crystal.
    this is too primitive way of cluster definition and service discovery.
 3. the /internal api is not really internal
 4. actually RAFT?
+
+
+BUGS
+----
+1. The following worked. when i killed the leader and reran it with a follower node id
+go run . -id=2 -port=8002 -peers=2:localhost:8002,3:localhost:8003     
+go run . -id=2 -port=8001 -peers=2:localhost:8002,3:localhost:8003     
+----
