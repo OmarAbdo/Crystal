@@ -1,10 +1,13 @@
 package main
 
+// Your handlers are now lean, synchronized conduits.
+// They drop user mutations into a proposal channel, forcing execution through a safe queue architecture.
+
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
+	"time"
 )
 
 type KeyValueRequest struct {
@@ -12,12 +15,19 @@ type KeyValueRequest struct {
 	Value string `json:"value"`
 }
 
-// HandleSet handles writing to the log and state machine
-// HandleSet now validates if the current node is the cluster leader before modifying state
-func HandleSet(store *CrystalStore, raft *RaftNode, cfg *Config) http.HandlerFunc {
+type Proposal struct {
+	Key      string
+	Value    string
+	ResultCh chan bool
+}
+
+// Global engine proposal queue to mimic decoupled execution seen in production etcd
+var ProposalQueue = make(chan Proposal, 100)
+
+func HandleSet(raft *RaftNode) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !raft.IsLeader() {
-			http.Error(w, fmt.Sprintf("Not the leader. Go to Node %d", raft.LeaderID), http.StatusForbidden)
+			http.Error(w, fmt.Sprintf("Not the leader. Route traffic to Node %d", raft.LeaderID), http.StatusForbidden)
 			return
 		}
 
@@ -32,28 +42,32 @@ func HandleSet(store *CrystalStore, raft *RaftNode, cfg *Config) http.HandlerFun
 			return
 		}
 
-		// 1. Append to local log ONLY
-		entry := store.AppendToLog(req.Key, req.Value)
-
-		// 2. Block and attempt to replicate to a majority of the cluster
-		quorumReached := store.ReplicateToPeers(cfg.Peers, entry)
-
-		if !quorumReached {
-			// In production, if we can't get quorum, we do NOT apply it to our state machine.
-			log.Printf("[API] Write failed - Quorum not reached for index %d", entry.Index)
-			http.Error(w, "Cluster write timeout: Quorum not reached", http.StatusServiceUnavailable)
+		if req.Key == "" {
+			http.Error(w, "Key cannot be empty", http.StatusBadRequest)
 			return
 		}
 
-		// 3. Quorum secured! Now it is safe to apply to our memory store
-		store.ApplyEntry(entry)
+		resCh := make(chan bool, 1)
+		ProposalQueue <- Proposal{
+			Key:      req.Key,
+			Value:    req.Value,
+			ResultCh: resCh,
+		}
 
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "OK\n")
+		select {
+		case success := <-resCh:
+			if success {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, "OK\n")
+			} else {
+				http.Error(w, "Commit verification failed", http.StatusInternalServerError)
+			}
+		case <-time.After(2000 * time.Millisecond):
+			http.Error(w, "Cluster write timeout: State engine busy or lost quorum", http.StatusServiceUnavailable)
+		}
 	}
 }
 
-// HandleGet handles reading from the state machine
 func HandleGet(store *CrystalStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -78,7 +92,6 @@ func HandleGet(store *CrystalStore) http.HandlerFunc {
 	}
 }
 
-// HandleInternalAppend processes replication requests from other cluster nodes
 func HandleInternalAppend(store *CrystalStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -92,8 +105,11 @@ func HandleInternalAppend(store *CrystalStore) http.HandlerFunc {
 			return
 		}
 
-		// Save the entry to our own log and state machine
-		store.ApplyEntry(entry)
+		// Direct append to follower's disk WAL file
+		if err := store.TruncateAndAppendFollower(entry); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "AppendOK\n")

@@ -1,58 +1,173 @@
 package main
 
+// This houses your in-memory placeholder for the future LSM-tree state machine,
+// the persistent append-only WAL layer, and the central execution loop.
+
 import (
-	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"net/http"
+	"os"
 	"sync"
-	"time"
 )
 
 type LogEntry struct {
 	Index int    `json:"index"`
+	Term  int    `json:"term"`
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
 type CrystalStore struct {
 	mu        sync.RWMutex
-	data      map[string]string
-	log       []LogEntry
+	data      map[string]string // Future MemTable / LSM-Tree entry point
+	logFile   *os.File
+	walPath   string
+	logCache  []LogEntry
 	nextIndex int
 }
 
-func NewCrystalStore() *CrystalStore {
-	return &CrystalStore{
+func NewCrystalStore(walPath string) (*CrystalStore, error) {
+	file, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL: %w", err)
+	}
+
+	cs := &CrystalStore{
 		data:      make(map[string]string),
-		log:       make([]LogEntry, 0),
+		logFile:   file,
+		walPath:   walPath,
+		logCache:  make([]LogEntry, 0),
 		nextIndex: 1,
 	}
+
+	if err := cs.recoverWAL(); err != nil {
+		return nil, fmt.Errorf("failed to recover WAL: %w", err)
+	}
+
+	return cs, nil
 }
 
-func (cs *CrystalStore) AppendToLog(key, value string) LogEntry {
+func (cs *CrystalStore) recoverWAL() error {
+	if _, err := cs.logFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	for {
+		var length uint32
+		if err := binary.Read(cs.logFile, binary.BigEndian, &length); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		buf := make([]byte, length)
+		if _, err := io.ReadFull(cs.logFile, buf); err != nil {
+			return err
+		}
+
+		var entry LogEntry
+		if err := json.Unmarshal(buf, &entry); err != nil {
+			return err
+		}
+
+		cs.logCache = append(cs.logCache, entry)
+		cs.nextIndex = entry.Index + 1
+	}
+	log.Printf("[WAL] Recovered %d log entries from disk. NextIndex: %d", len(cs.logCache), cs.nextIndex)
+	return nil
+}
+
+func (cs *CrystalStore) AppendToWAL(key, value string, term int) (LogEntry, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
 	entry := LogEntry{
 		Index: cs.nextIndex,
+		Term:  term,
 		Key:   key,
 		Value: value,
 	}
-	cs.log = append(cs.log, entry)
-	cs.nextIndex++
 
-	log.Printf("[STORE] Log Appended: Index %d -> Set %s = %s", entry.Index, entry.Key, entry.Value)
-	return entry
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return LogEntry{}, err
+	}
+
+	// Write frame length prefix followed by payload
+	length := uint32(len(data))
+	if err := binary.Write(cs.logFile, binary.BigEndian, length); err != nil {
+		return LogEntry{}, err
+	}
+
+	if _, err := cs.logFile.Write(data); err != nil {
+		return LogEntry{}, err
+	}
+
+	// Explicit fsync for durability guarantees matching etcd behavior
+	if err := cs.logFile.Sync(); err != nil {
+		return LogEntry{}, err
+	}
+
+	cs.logCache = append(cs.logCache, entry)
+	cs.nextIndex++
+	return entry, nil
 }
 
-func (cs *CrystalStore) ApplyEntry(entry LogEntry) {
+func (cs *CrystalStore) TruncateAndAppendFollower(entry LogEntry) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
+	// If entry index conflicts with cache, truncate cache and reset disk WAL file
+	if entry.Index <= len(cs.logCache) {
+		cs.logCache = cs.logCache[:entry.Index-1]
+		if err := cs.logFile.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := cs.logFile.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		// Rewrite unconflicting cache entries to disk
+		for _, e := range cs.logCache {
+			data, _ := json.Marshal(e)
+			length := uint32(len(data))
+			_ = binary.Write(cs.logFile, binary.BigEndian, length)
+			_, _ = cs.logFile.Write(data)
+		}
+		_ = cs.logFile.Sync()
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+
+	length := uint32(len(data))
+	if err := binary.Write(cs.logFile, binary.BigEndian, length); err != nil {
+		return err
+	}
+	if _, err := cs.logFile.Write(data); err != nil {
+		return err
+	}
+	if err := cs.logFile.Sync(); err != nil {
+		return err
+	}
+
+	cs.logCache = append(cs.logCache, entry)
+	cs.nextIndex = entry.Index + 1
+	return nil
+}
+
+func (cs *CrystalStore) ApplyToStateMachine(entry LogEntry) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	// This is where your LSM-tree / MemTable component will accept entries
 	cs.data[entry.Key] = entry.Value
-	log.Printf("[STORE] State Machine Applied: Index %d", entry.Index)
+	log.Printf("[STATE MACHINE] Committed entry applied safely: Index %d (%s = %s)", entry.Index, entry.Key, entry.Value)
 }
 
 func (cs *CrystalStore) Get(key string) (string, bool) {
@@ -62,55 +177,17 @@ func (cs *CrystalStore) Get(key string) (string, bool) {
 	return val, ok
 }
 
-// ReplicateToPeers forwards a log entry to all tracked peer nodes
-// ReplicateToPeers now blocks until a quorum of nodes acknowledges the log entry
-func (cs *CrystalStore) ReplicateToPeers(peers map[int]string, entry LogEntry) bool {
-	// 1. We start with 1 vote (the leader itself automatically counts)
-	successes := 1
-	targetQuorum := (len(peers)+1)/2 + 1 // Formula for majority
-
-	// A channel to collect successes from concurrent goroutines
-	ackChan := make(chan bool, len(peers))
-
-	for peerID, peerAddr := range peers {
-		go func(id int, addr string) {
-			client := &http.Client{Timeout: 1 * time.Second}
-			jsonData, _ := json.Marshal(entry)
-			url := fmt.Sprintf("http://%s/internal/append", addr)
-
-			resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
-			if err != nil {
-				ackChan <- false
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				ackChan <- true
-			} else {
-				ackChan <- false
-			}
-		}(peerID, peerAddr)
+func (cs *CrystalStore) GetEntry(index int) (LogEntry, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if index <= 0 || index > len(cs.logCache) {
+		return LogEntry{}, false
 	}
+	return cs.logCache[index-1], true
+}
 
-	// 2. Wait for responses or a global timeout
-	timeout := time.After(1500 * time.Millisecond)
-
-	for i := 0; i < len(peers); i++ {
-		select {
-		case success := <-ackChan:
-			if success {
-				successes++
-			}
-			// If we hit quorum early, we can stop waiting and return success!
-			if successes >= targetQuorum {
-				return true
-			}
-		case <-timeout:
-			log.Printf("[STORE] Quorum timeout waiting for index %d", entry.Index)
-			return false
-		}
-	}
-
-	return successes >= targetQuorum
+func (cs *CrystalStore) Close() error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.logFile.Close()
 }
