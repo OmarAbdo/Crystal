@@ -1,1 +1,7 @@
 discussion
+private notes.txt
+logs/
+data/
+*.wal
+*.meta
+snapshot.json
