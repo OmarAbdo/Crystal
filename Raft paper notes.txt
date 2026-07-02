@@ -1,0 +1,32 @@
+أي نموذج معرفي قادر على إنتاج إنسان متكامل وحياة ذات معنى؟
+
+
+Epistemological Level
+
+Transcendental Model
+
+"a stronger degree of coherency"
+"overlapping majorty to garantee safety"
+"Raft we applied specific techniques to improve understandability, including decomposition (Raft separates leader election, log replication, and safety) and state space reduction (relative to Paxos, Raft reduces the degree of nondeterminism and the ways servers can be inconsistent with each other)"
+
+"Strong leader: log entries only flow from the leader to other servers. This simplifies the management of the replicated log"
+
+
+"Leader election: Raft uses randomized timers to elect leaders. This adds only a small amount of mechanism to the heartbeats already required for any consensus algorithm"
+
+"Membership changes: Raft’s mechanism for changing the set of servers in the cluster uses a new (joint consensus) approach where the majorities of two different configurations overlap during transitions. This allows the cluster to continue operating normally during configuration changes."
+
+"The remainder of the paper introduces the replicated state machine problem (Section 2)"
+
+"Consensus algorithms typically arise in the context of replicated state machines [37]."
+
+"Keeping the replicated log consistent is the job of the consensus algorithm"
+
+"Consensus algorithms for practical systems typically have the following properties
+They ensure safety (never returning an incorrect result) under all non-Byzantine
+They are fully functional (available) as long as any majority of the servers are operational
+They do not depend on timing to ensure the consistency of the logs: faulty clocks and 
+extreme message delays can, at worst, cause availability problems
+In the common case, a command can complete as soon as a majority of the cluster has responded to a single round 
+of remote procedure calls; a minority of slow servers need not impact overall system performance.
+"
