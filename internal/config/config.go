@@ -14,6 +14,11 @@ type Config struct {
 	Port     string    // e.g. ":8080"
 	DataDir  string    // directory for WAL, metadata, snapshot files
 	Peers    map[int]string // peerID → "host:port"
+
+	// CompactionThreshold is the cache size that triggers a snapshot + WAL
+	// truncation. 0 means "use the RaftLog default" (1000). Exposed mainly so
+	// integration tests can force compaction with a small log.
+	CompactionThreshold int
 }
 
 // WALPath returns the full path to this node's WAL file.
@@ -37,14 +42,16 @@ func ParseFlags() (*Config, error) {
 	portFlag := flag.String("port", "8080", "TCP port for this node to listen on")
 	dataDirFlag := flag.String("data-dir", "data", "Directory for WAL, metadata, and snapshot files")
 	peersFlag := flag.String("peers", "", "Comma-separated peer list: id:host:port,id:host:port")
+	compactionFlag := flag.Int("compaction-threshold", 0, "Log size that triggers compaction (0 = default 1000)")
 
 	flag.Parse()
 
 	cfg := &Config{
-		NodeID:  *idFlag,
-		Port:    ":" + *portFlag,
-		DataDir: *dataDirFlag,
-		Peers:   make(map[int]string),
+		NodeID:              *idFlag,
+		Port:                ":" + *portFlag,
+		DataDir:             *dataDirFlag,
+		Peers:               make(map[int]string),
+		CompactionThreshold: *compactionFlag,
 	}
 
 	if err := parsePeers(*peersFlag, cfg.Peers); err != nil {
