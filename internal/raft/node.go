@@ -21,6 +21,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 )
 
 // RaftNode holds the consensus state for one node.
@@ -28,15 +29,30 @@ type RaftNode struct {
 	mu sync.RWMutex
 
 	// Identity
-	nodeID  int
-	peerIDs []int
+	nodeID      int
+	peerIDs     []int
+	clusterSize int // total voting members (peers + self); fixed at startup
 
 	// Volatile state (reset on restart — safe per Raft spec)
 	Role        NodeRole
 	LeaderID    int
 	CommitIndex int
 	LastApplied int
-	MatchIndex  map[int]int // peerID → highest log index confirmed replicated
+
+	// Election bookkeeping (volatile).
+	// lastContact is the moment we last heard from a legitimate leader or granted
+	// a vote; the engine compares it against a randomized election timeout to
+	// decide when to start an election. votesGranted counts votes in the current
+	// election (candidate only).
+	lastContact  time.Time
+	votesGranted int
+
+	// Leader-only volatile state (reinitialized after each election, Figure 2).
+	// NextIndex is the index of the next log entry the leader will send to a
+	// peer (initialized to leader's lastIndex+1). MatchIndex is the highest
+	// index known to be replicated on that peer (initialized to 0).
+	NextIndex  map[int]int // peerID → next index to send
+	MatchIndex map[int]int // peerID → highest log index confirmed replicated
 
 	// Persistent state (must survive restarts)
 	persistent     PersistentState
@@ -44,23 +60,29 @@ type RaftNode struct {
 }
 
 // NewRaftNode creates a node, loading persistent state from disk if it exists.
-func NewRaftNode(nodeID int, peerIDs []int, metadataPath string, initialRole NodeRole) (*RaftNode, error) {
+// clusterSize is the total number of voting members (len(peers)+1); it fixes
+// the majority threshold used for elections and commitment.
+func NewRaftNode(nodeID int, peerIDs []int, clusterSize int, metadataPath string, initialRole NodeRole) (*RaftNode, error) {
 	rn := &RaftNode{
 		nodeID:       nodeID,
 		peerIDs:      peerIDs,
+		clusterSize:  clusterSize,
 		Role:         initialRole,
-		LeaderID:     1, // bootstrap assumption; overwritten by elections
+		LeaderID:     0, // unknown until we hear from a leader or win an election
 		CommitIndex:  0,
 		LastApplied:  0,
+		lastContact:  time.Now(),
+		NextIndex:    make(map[int]int),
 		MatchIndex:   make(map[int]int),
 		metadataPath: metadataPath,
 		persistent: PersistentState{
-			CurrentTerm: 1,
+			CurrentTerm: 0, // first boot; first election bumps to 1 (Figure 2)
 			VotedFor:    -1,
 		},
 	}
 
 	for _, pid := range peerIDs {
+		rn.NextIndex[pid] = 1
 		rn.MatchIndex[pid] = 0
 	}
 
@@ -101,7 +123,8 @@ func (rn *RaftNode) NodeID() int {
 // ---- Mutation methods ----
 
 // UpdatePeerProgress records that peerID has replicated up to matchIndex.
-// Called by the replicator after a successful append response.
+// Called by the replicator after a successful AppendEntries response.
+// Per Figure 2, a success advances both matchIndex and nextIndex for the peer.
 func (rn *RaftNode) UpdatePeerProgress(peerID, matchIndex int) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -110,6 +133,49 @@ func (rn *RaftNode) UpdatePeerProgress(peerID, matchIndex int) {
 		rn.MatchIndex[peerID] = matchIndex
 		log.Printf("[RAFT] Peer %d matchIndex → %d", peerID, matchIndex)
 	}
+	// nextIndex is always one past the highest confirmed match.
+	if matchIndex+1 > rn.NextIndex[peerID] {
+		rn.NextIndex[peerID] = matchIndex + 1
+	}
+}
+
+// NextIndexFor returns the next log index the leader should send to peerID.
+func (rn *RaftNode) NextIndexFor(peerID int) int {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	ni := rn.NextIndex[peerID]
+	if ni < 1 {
+		return 1
+	}
+	return ni
+}
+
+// BacktrackNextIndex lowers nextIndex for peerID after an AppendEntries
+// rejection so the leader can find the point where the logs agree (§5.3).
+//
+// It uses the follower's conflict hints when available: conflictIndex is the
+// first index the follower holds for the conflicting term (or its log length+1
+// when it is simply missing entries). This lets the leader skip an entire term
+// of conflicting entries in one step rather than decrementing by one per RPC.
+// When no hint is supplied (conflictIndex <= 0) it falls back to a plain
+// decrement. nextIndex never drops below 1.
+func (rn *RaftNode) BacktrackNextIndex(peerID, conflictIndex int) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	current := rn.NextIndex[peerID]
+	var next int
+	switch {
+	case conflictIndex > 0 && conflictIndex < current:
+		next = conflictIndex
+	default:
+		next = current - 1
+	}
+	if next < 1 {
+		next = 1
+	}
+	rn.NextIndex[peerID] = next
+	log.Printf("[RAFT] Peer %d nextIndex backtracked → %d", peerID, next)
 }
 
 // AdvanceCommitIndex checks whether a new commit index can be established
@@ -117,10 +183,16 @@ func (rn *RaftNode) UpdatePeerProgress(peerID, matchIndex int) {
 // (to avoid holding both locks) and returns the new commit index if advanced,
 // or 0 if not.
 //
-// Raft safety rule: a leader may only commit an entry from the current term.
-// Entries from previous terms are committed implicitly when a current-term
-// entry is committed (§5.4.2).
-func (rn *RaftNode) AdvanceCommitIndex(localLatestIndex, localLatestTerm, currentTerm int) (newCommitIndex int, advanced bool) {
+// Raft safety rule (§5.4.2): a leader may only advance commitIndex to an entry
+// N when log[N].term == currentTerm. It must NOT commit an entry from a previous
+// term merely because a majority has replicated it — Figure 8 shows how doing so
+// lets a later higher-term leader overwrite a supposedly-committed entry.
+// Previous-term entries commit implicitly, once a current-term entry above them
+// reaches quorum.
+//
+// termAt returns the term of the entry at a given log index (supplied by the
+// caller so this method never touches the RaftLog lock while holding rn.mu).
+func (rn *RaftNode) AdvanceCommitIndex(localLatestIndex int, termAt func(index int) int, currentTerm int) (newCommitIndex int, advanced bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
@@ -139,14 +211,285 @@ func (rn *RaftNode) AdvanceCommitIndex(localLatestIndex, localLatestTerm, curren
 	sort.Sort(sort.Reverse(sort.IntSlice(indices)))
 	quorumIndex := indices[len(indices)/2]
 
-	// Only commit if quorumIndex is in the current term (safety invariant).
-	if quorumIndex > rn.CommitIndex && localLatestTerm == currentTerm {
+	// Commit only if the QUORUM INDEX ITSELF is a current-term entry (§5.4.2).
+	// Checking the term of quorumIndex — not the leader's last entry — is what
+	// prevents the Figure 8 violation.
+	if quorumIndex > rn.CommitIndex && termAt(quorumIndex) == currentTerm {
 		rn.CommitIndex = quorumIndex
 		log.Printf("[RAFT] CommitIndex advanced to %d", rn.CommitIndex)
 		return rn.CommitIndex, true
 	}
 
 	return rn.CommitIndex, false
+}
+
+// HandleAppendEntries implements the follower side of the AppendEntries RPC
+// receiver (Figure 2). It is the single authority for the consistency check and
+// commit advancement, keeping that consensus logic out of the transport layer.
+//
+// Steps:
+//  1. Reply false if req.Term < currentTerm (§5.1) — stale leader.
+//  2. If req.Term > currentTerm (or we're a candidate/leader at the same term),
+//     recognize the sender as leader and step down (§5.2). Any valid AppendEntries
+//     also refreshes our sense that a leader is alive.
+//  3. Run the log-matching check + splice (steps 2–4) via RaftLog.AppendEntriesToLog.
+//  4. On success, advance commitIndex = min(leaderCommit, last new index) (step 5).
+//
+// It takes the RaftLog explicitly rather than holding a reference, preserving the
+// rule that RaftNode.mu and RaftLog.mu are never held simultaneously: this method
+// touches rn.mu only for term/role/commit, and delegates all log mutation to the
+// log's own lock.
+func (rn *RaftNode) HandleAppendEntries(rl *RaftLog, req AppendEntriesRequest) AppendEntriesResponse {
+	currentTerm := rn.CurrentTerm()
+
+	// Step 1: reject a stale leader outright.
+	if req.Term < currentTerm {
+		return AppendEntriesResponse{Term: currentTerm, Success: false}
+	}
+
+	// Step 2: the leader's term is current or newer. Accept its authority and,
+	// if the term advanced (or we thought we were leader/candidate), step down.
+	// BecomeFollower persists term+votedFor before we act on the entries, which
+	// is required before responding to the RPC (Figure 2, stable-storage rule).
+	role, _ := rn.State()
+	if req.Term > currentTerm || role != Follower {
+		if err := rn.BecomeFollower(req.Term, req.LeaderID); err != nil {
+			log.Printf("[RAFT] BecomeFollower during AppendEntries failed: %v", err)
+			return AppendEntriesResponse{Term: currentTerm, Success: false}
+		}
+		currentTerm = req.Term
+	} else {
+		// Same term, already a follower: just refresh the known leader.
+		rn.mu.Lock()
+		rn.LeaderID = req.LeaderID
+		rn.mu.Unlock()
+	}
+
+	// A valid AppendEntries from the current leader resets the election timer:
+	// this is how a live leader's heartbeats suppress spurious elections (§5.2).
+	rn.noteContact()
+
+	// Steps 2–4: consistency check and splice, owned by the log.
+	matchIndex, conflictTerm, conflictIndex, ok := rl.AppendEntriesToLog(
+		req.PrevLogIndex, req.PrevLogTerm, req.Entries)
+	if !ok {
+		return AppendEntriesResponse{
+			Term:          currentTerm,
+			Success:       false,
+			ConflictTerm:  conflictTerm,
+			ConflictIndex: conflictIndex,
+		}
+	}
+
+	// Step 5: advance our commit index toward the leader's.
+	rn.SetFollowerCommitIndex(req.LeaderCommit, matchIndex)
+
+	return AppendEntriesResponse{
+		Term:       currentTerm,
+		Success:    true,
+		MatchIndex: matchIndex,
+	}
+}
+
+// HandleInstallSnapshot implements the InstallSnapshot receiver (Figure 13). It
+// is invoked when the leader has already compacted past a follower's nextIndex
+// and must ship the whole snapshot instead of log entries.
+//
+// The state-machine restore and snapshot-persist steps are passed as callbacks
+// because the raft package cannot import store (store imports raft). This keeps
+// all consensus/term logic here while the effects live in the caller's layer.
+//
+//	restore(data)   — reset the state machine from the snapshot bytes (step 8)
+//	persist()       — durably write the snapshot to disk (step 5), called only
+//	                  after the log has been reset so a crash can't leave a
+//	                  snapshot that references discarded entries
+//
+// Steps 6–7 (log reset) are performed by rl.ResetToSnapshot.
+func (rn *RaftNode) HandleInstallSnapshot(
+	rl *RaftLog,
+	req InstallSnapshotRequest,
+	restore func(data []byte) error,
+	persist func() error,
+) InstallSnapshotResponse {
+	currentTerm := rn.CurrentTerm()
+
+	// Step 1: reject a stale leader.
+	if req.Term < currentTerm {
+		return InstallSnapshotResponse{Term: currentTerm}
+	}
+
+	// Accept the leader's authority; step down if the term advanced or we were
+	// not already a follower. Persist-before-respond is honored by BecomeFollower.
+	role, _ := rn.State()
+	if req.Term > currentTerm || role != Follower {
+		if err := rn.BecomeFollower(req.Term, req.LeaderID); err != nil {
+			log.Printf("[RAFT] BecomeFollower during InstallSnapshot failed: %v", err)
+			return InstallSnapshotResponse{Term: currentTerm}
+		}
+		currentTerm = req.Term
+	} else {
+		rn.mu.Lock()
+		rn.LeaderID = req.LeaderID
+		rn.mu.Unlock()
+	}
+	rn.noteContact() // a valid snapshot is a sign of life; reset election timer
+
+	// If we already cover this snapshot's index, it's stale — ack and move on.
+	if req.LastIncludedIndex <= rn.snapshotFloor(rl) {
+		return InstallSnapshotResponse{Term: currentTerm}
+	}
+
+	// Step 8: reset the state machine from the snapshot data.
+	if err := restore(req.Data); err != nil {
+		log.Printf("[RAFT] InstallSnapshot state restore failed: %v", err)
+		return InstallSnapshotResponse{Term: currentTerm}
+	}
+
+	// Steps 6–7: reconcile the log against the snapshot boundary.
+	if err := rl.ResetToSnapshot(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
+		log.Printf("[RAFT] InstallSnapshot log reset failed: %v", err)
+		return InstallSnapshotResponse{Term: currentTerm}
+	}
+
+	// Step 5: persist the snapshot durably now that the log agrees with it.
+	if err := persist(); err != nil {
+		log.Printf("[RAFT] InstallSnapshot persist failed: %v", err)
+		return InstallSnapshotResponse{Term: currentTerm}
+	}
+
+	// Advance commit/applied to the snapshot boundary — everything up to here is
+	// durably part of the state machine now.
+	rn.SeedFromSnapshot(req.LastIncludedIndex)
+
+	log.Printf("[RAFT] Installed snapshot through index %d term %d",
+		req.LastIncludedIndex, req.LastIncludedTerm)
+	return InstallSnapshotResponse{Term: currentTerm}
+}
+
+// snapshotFloor returns the follower's current compaction boundary, used to
+// detect a redundant (stale) InstallSnapshot.
+func (rn *RaftNode) snapshotFloor(rl *RaftLog) int {
+	return rl.FirstIndex() - 1
+}
+
+// ---- Election ----
+
+// noteContact records that we just heard from a legitimate leader or granted a
+// vote, resetting the election-timeout clock.
+func (rn *RaftNode) noteContact() {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.lastContact = time.Now()
+}
+
+// TimeSinceContact reports how long it has been since the last valid contact
+// from a leader or vote grant. The engine compares this against a randomized
+// election timeout to decide when to start an election.
+func (rn *RaftNode) TimeSinceContact() time.Duration {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return time.Since(rn.lastContact)
+}
+
+// ClusterSize returns the fixed number of voting members.
+func (rn *RaftNode) ClusterSize() int {
+	return rn.clusterSize
+}
+
+// BecomeCandidate starts a new election (Figure 2, Candidates): it increments
+// the term, votes for itself, resets the election timer, and persists the new
+// term+vote to stable storage before any RequestVote RPCs go out. It returns
+// the new term so the caller can build the RequestVote requests. The caller
+// supplies the candidate's last log index/term (read from the RaftLog under its
+// own lock) to preserve the never-hold-both-locks discipline.
+func (rn *RaftNode) BecomeCandidate() (term int, err error) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	rn.Role = Candidate
+	rn.persistent.CurrentTerm++
+	rn.persistent.VotedFor = rn.nodeID
+	rn.LeaderID = 0
+	rn.votesGranted = 1 // vote for self
+	rn.lastContact = time.Now()
+
+	if err := rn.savePersistentStateLocked(); err != nil {
+		return 0, err
+	}
+
+	log.Printf("[RAFT] Node %d starting election for term %d", rn.nodeID, rn.persistent.CurrentTerm)
+	return rn.persistent.CurrentTerm, nil
+}
+
+// RecordVoteAndCheckMajority tallies one granted vote for the current election
+// and reports whether the candidate now holds a majority. It ignores votes if
+// the node is no longer a candidate or the vote came from a stale term.
+func (rn *RaftNode) RecordVoteAndCheckMajority(voteTerm int) (wonMajority bool) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.Role != Candidate || voteTerm != rn.persistent.CurrentTerm {
+		return false
+	}
+	rn.votesGranted++
+	return rn.votesGranted > rn.clusterSize/2
+}
+
+// HandleRequestVote implements the RequestVote receiver (Figure 2). It is the
+// single authority for the vote decision, keeping consensus logic out of
+// transport. The §5.4.1 election restriction is enforced via the up-to-date
+// comparison. Vote grants are persisted before responding (stable-storage rule).
+func (rn *RaftNode) HandleRequestVote(req RequestVoteRequest, myLastIndex, myLastTerm int) RequestVoteResponse {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// Step 1: reject a candidate from an older term.
+	if req.Term < rn.persistent.CurrentTerm {
+		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
+	}
+
+	// A newer term means we must step down and clear our old vote before we can
+	// consider granting one in the new term (§5.1, "All Servers" rule).
+	if req.Term > rn.persistent.CurrentTerm {
+		rn.persistent.CurrentTerm = req.Term
+		rn.persistent.VotedFor = -1
+		rn.Role = Follower
+		rn.LeaderID = 0
+	}
+
+	// Step 2: grant the vote iff we haven't voted for anyone else this term AND
+	// the candidate's log is at least as up-to-date as ours (§5.4.1).
+	alreadyVoted := rn.persistent.VotedFor != -1 && rn.persistent.VotedFor != req.CandidateID
+	upToDate := candidateUpToDate(req.LastLogTerm, req.LastLogIndex, myLastTerm, myLastIndex)
+
+	if alreadyVoted || !upToDate {
+		// Persist any term bump from above before replying.
+		if err := rn.savePersistentStateLocked(); err != nil {
+			log.Printf("[RAFT] persist during vote-deny failed: %v", err)
+		}
+		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
+	}
+
+	rn.persistent.VotedFor = req.CandidateID
+	rn.lastContact = time.Now() // granting a vote resets our election timer
+	if err := rn.savePersistentStateLocked(); err != nil {
+		log.Printf("[RAFT] persist during vote-grant failed: %v", err)
+		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
+	}
+
+	log.Printf("[RAFT] Node %d granted vote to %d for term %d", rn.nodeID, req.CandidateID, req.Term)
+	return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: true}
+}
+
+// candidateUpToDate implements Raft's "at least as up-to-date" comparison
+// (§5.4.1): the log with the later last-entry term is more up-to-date; if the
+// terms tie, the longer log wins. Returns true iff the candidate is at least
+// as up-to-date as the voter.
+func candidateUpToDate(candTerm, candIndex, voterTerm, voterIndex int) bool {
+	if candTerm != voterTerm {
+		return candTerm > voterTerm
+	}
+	return candIndex >= voterIndex
 }
 
 // SetFollowerCommitIndex is called on followers when the leader's
@@ -184,31 +527,73 @@ func (rn *RaftNode) CommitAndApplyBoundary() (commitIndex, lastApplied int) {
 	return rn.CommitIndex, rn.LastApplied
 }
 
-// BecomeFollower transitions the node to follower state, updating term
-// and persisting. Called when a higher term is observed in any RPC.
+// SeedFromSnapshot sets CommitIndex and LastApplied to a snapshot's last
+// included index at startup. Without this, a node that restarts from a snapshot
+// starts with commit/applied at 0 and the apply loop walks through already-
+// compacted indices ("Missing log entry — skipping") — those entries are gone
+// but their effects are already baked into the restored state machine.
+// Raises the boundaries monotonically; never lowers them.
+func (rn *RaftNode) SeedFromSnapshot(lastIncludedIndex int) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	if lastIncludedIndex > rn.CommitIndex {
+		rn.CommitIndex = lastIncludedIndex
+	}
+	if lastIncludedIndex > rn.LastApplied {
+		rn.LastApplied = lastIncludedIndex
+	}
+}
+
+// BecomeFollower transitions the node to follower state, updating term and
+// persisting. Called both when a higher term is observed (election loss,
+// stale-leader stepdown) and when a same-term leader asserts authority over a
+// candidate.
+//
+// VotedFor is cleared ONLY when the term actually increases (review bug #3): a
+// new term is a fresh voting round, but a same-term stepdown must preserve the
+// vote already cast this term to honor Raft's one-vote-per-term invariant.
 func (rn *RaftNode) BecomeFollower(term, leaderID int) error {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
 	rn.Role = Follower
 	rn.LeaderID = leaderID
-	rn.persistent.CurrentTerm = term
-	rn.persistent.VotedFor = -1
+	if term > rn.persistent.CurrentTerm {
+		rn.persistent.CurrentTerm = term
+		rn.persistent.VotedFor = -1
+	}
 
 	return rn.savePersistentStateLocked()
 }
 
-// BecomeLeader transitions the node to leader (called after winning election).
-func (rn *RaftNode) BecomeLeader() {
+// BecomeLeader promotes the node to leader after winning an election. It is
+// guarded against a stepdown race (review bug #2): between tallying the winning
+// vote and calling this, a higher-term RPC on an HTTP goroutine may have already
+// stepped the node down to follower. Promoting anyway would create two leaders
+// in that higher term. So this no-ops (returning false) unless, under the lock,
+// the node is STILL a candidate in electionTerm.
+//
+// On success it reinitializes leader volatile state per Figure 2: nextIndex for
+// every peer to lastLogIndex+1, matchIndex to 0. The leader then re-probes each
+// follower via the AppendEntries consistency check, backtracking as needed.
+func (rn *RaftNode) BecomeLeader(electionTerm, lastLogIndex int) (promoted bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
+
+	if rn.Role != Candidate || rn.persistent.CurrentTerm != electionTerm {
+		log.Printf("[RAFT] Node %d abandoning stale election win (term %d, role %s, current term %d)",
+			rn.nodeID, electionTerm, rn.Role, rn.persistent.CurrentTerm)
+		return false
+	}
+
 	rn.Role = Leader
 	rn.LeaderID = rn.nodeID
-	// Reset peer progress; leader re-probes from its own log tail.
 	for pid := range rn.MatchIndex {
+		rn.NextIndex[pid] = lastLogIndex + 1
 		rn.MatchIndex[pid] = 0
 	}
 	log.Printf("[RAFT] Node %d became Leader for term %d", rn.nodeID, rn.persistent.CurrentTerm)
+	return true
 }
 
 // ---- Persistent state management ----
