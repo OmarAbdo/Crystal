@@ -1,24 +1,29 @@
 package engine
 
 // Engine is the central orchestration loop of CrystalDB.
-// It is the only goroutine that mutates the RaftNode's CommitIndex
-// and LastApplied, which eliminates an entire class of race conditions
-// that existed in the original main.go.
 //
-// Responsibilities:
-//   1. Dequeue proposals from the ProposalQueue
-//   2. Write to the RaftLog (leader only)
-//   3. Trigger parallel replication to peers
-//   4. Poll for quorum and advance CommitIndex
-//   5. Apply committed entries to the StateMachine in index order
-//   6. Trigger log compaction when the log grows past the threshold
+// Concurrency model (etcd-style):
+//   - A single control goroutine (Run) owns all consensus STATE transitions:
+//     it is the ONLY goroutine that advances CommitIndex/LastApplied, applies
+//     entries, runs elections, and fires client waiters. This preserves the
+//     single-writer discipline that keeps commit/apply race-free.
+//   - One long-lived REPLICATION goroutine per peer (peerReplicator) owns all
+//     outbound RPC latency for that peer. A slow or black-holed peer therefore
+//     slows only itself — it can no longer stall heartbeats, proposals, or the
+//     control loop. Replicators only call the node's already-locked mutators
+//     (UpdatePeerProgress / BacktrackNextIndex) and report a higher observed
+//     term back to the control loop via a channel.
 //
-// The engine does NOT hold any locks while waiting for replication —
-// replication goroutines call RaftNode.UpdatePeerProgress independently,
-// and the engine polls CommitIndex on each tick.
+// Proposals are non-blocking: handleProposal appends to the log, registers a
+// pending waiter keyed by log index, notifies the replicators, and returns.
+// When the control loop advances CommitIndex past a waiter's index it fires the
+// waiter's result channel. A deadline sweep fails waiters that never commit, and
+// a stepdown fails all outstanding waiters at once.
 
 import (
 	"log"
+	"math/rand"
+	"sync"
 	"time"
 
 	"crystal/internal/config"
@@ -27,15 +32,31 @@ import (
 )
 
 const (
-	tickInterval      = 20 * time.Millisecond
-	proposalTimeout   = 2 * time.Second
-	quorumPollTimeout = 1500 * time.Millisecond
+	tickInterval    = 20 * time.Millisecond
+	proposalTimeout = 2 * time.Second
+
+	// Election timing (§5.2). The election timeout is chosen randomly from
+	// [electionTimeoutMin, electionTimeoutMax] per node, per election, so that
+	// in most cases only one node times out and split votes are rare. The
+	// heartbeat interval must be comfortably shorter than electionTimeoutMin so
+	// a live leader's heartbeats keep resetting followers' timers.
+	electionTimeoutMin = 300 * time.Millisecond
+	electionTimeoutMax = 600 * time.Millisecond
+	heartbeatInterval  = 100 * time.Millisecond
 )
 
 // Proposal is a client write request flowing through the engine.
 type Proposal struct {
 	Command  raft.Command
 	ResultCh chan error // nil error = committed successfully
+}
+
+// waiter couples a client's result channel to the log index it is waiting to
+// have committed, plus a deadline after which the proposal fails.
+type waiter struct {
+	index    int
+	resultCh chan error
+	deadline time.Time
 }
 
 // Engine drives the consensus and application loop.
@@ -47,6 +68,20 @@ type Engine struct {
 	replicator   *raft.Replicator
 	peers        map[int]string
 	proposals    chan Proposal
+
+	// Control-loop-only state (accessed solely from the Run goroutine).
+	rng             *rand.Rand
+	electionTimeout time.Duration // current randomized deadline for this cycle
+	waiters         []*waiter     // pending client proposals, ascending by index
+
+	// Per-peer replication goroutines, live only while we are leader.
+	replicators map[int]*peerReplicator
+	replWG      sync.WaitGroup
+
+	// stepDownCh carries a higher term observed by any replication goroutine.
+	// The control loop drains it and steps down. Buffered so a replicator never
+	// blocks reporting it.
+	stepDownCh chan int
 }
 
 // New creates an Engine. The proposals channel is exposed via ProposalQueue().
@@ -57,7 +92,7 @@ func New(
 	sm store.StateMachine,
 	snapshots *store.SnapshotManager,
 ) *Engine {
-	return &Engine{
+	e := &Engine{
 		node:         node,
 		raftLog:      raftLog,
 		stateMachine: sm,
@@ -65,7 +100,20 @@ func New(
 		replicator:   raft.NewReplicator(),
 		peers:        cfg.Peers,
 		proposals:    make(chan Proposal, 100),
+		rng:          rand.New(rand.NewSource(time.Now().UnixNano() + int64(node.NodeID()))),
+		replicators:  make(map[int]*peerReplicator),
+		stepDownCh:   make(chan int, len(cfg.Peers)+1),
 	}
+	e.resetElectionTimeout()
+	return e
+}
+
+// resetElectionTimeout picks a fresh randomized election deadline from the
+// [min, max] interval. Called at startup and after each election attempt so
+// that repeated split votes desynchronize (§5.2).
+func (e *Engine) resetElectionTimeout() {
+	span := int64(electionTimeoutMax - electionTimeoutMin)
+	e.electionTimeout = electionTimeoutMin + time.Duration(e.rng.Int63n(span))
 }
 
 // ProposalQueue returns the channel callers use to submit write proposals.
@@ -73,20 +121,25 @@ func (e *Engine) ProposalQueue() chan<- Proposal {
 	return e.proposals
 }
 
-// Run starts the engine loop. Call in a goroutine; it runs until ctx is cancelled
-// or the process exits. Using a done channel keeps it compatible with Go 1.22
-// without importing context into the engine.
+// Run starts the control loop. Call in a goroutine; it runs until done is closed.
+// It never blocks on replication — RPC latency lives entirely in the per-peer
+// replication goroutines.
 func (e *Engine) Run(done <-chan struct{}) {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
+	defer e.stopReplicators()
 
 	for {
 		select {
 		case <-done:
+			e.failAllWaiters(ErrNotLeader)
 			return
 
 		case prop := <-e.proposals:
 			e.handleProposal(prop)
+
+		case higherTerm := <-e.stepDownCh:
+			e.handleStepDown(higherTerm)
 
 		case <-ticker.C:
 			e.onTick()
@@ -94,14 +147,17 @@ func (e *Engine) Run(done <-chan struct{}) {
 	}
 }
 
-// handleProposal processes a single write proposal end-to-end.
+// ---- Proposal handling (non-blocking) ----
+
+// handleProposal appends a proposal to the log and registers a waiter, then
+// returns immediately. The commit is confirmed later by the control loop when
+// CommitIndex advances past the entry's index. It does NOT wait on replication.
 func (e *Engine) handleProposal(prop Proposal) {
 	if !e.node.IsLeader() {
 		prop.ResultCh <- ErrNotLeader
 		return
 	}
 
-	// Encode the application command into opaque bytes for the log envelope.
 	cmdBytes, err := raft.EncodeCommand(prop.Command)
 	if err != nil {
 		prop.ResultCh <- err
@@ -115,57 +171,100 @@ func (e *Engine) handleProposal(prop Proposal) {
 		return
 	}
 
-	// Fan out replication in parallel. Each goroutine calls
-	// node.UpdatePeerProgress on success — no lock contention here.
-	for peerID, addr := range e.peers {
-		go e.replicator.ReplicateEntry(e.node, peerID, addr, entry)
-	}
+	e.waiters = append(e.waiters, &waiter{
+		index:    entry.Index,
+		resultCh: prop.ResultCh,
+		deadline: time.Now().Add(proposalTimeout),
+	})
 
-	// Poll until committed or timed out.
-	committed := e.waitForCommit(entry)
-	if !committed {
-		prop.ResultCh <- ErrCommitTimeout
-		return
-	}
-
-	// Apply all newly committed entries in order.
-	e.applyCommitted()
-
-	// Compact if the log has grown past the threshold.
-	commitIndex, _ := e.node.CommitAndApplyBoundary()
-	if e.raftLog.NeedsCompaction(commitIndex) {
-		e.compact(commitIndex)
-	}
-
-	prop.ResultCh <- nil
+	// Wake the replicators so the new entry ships promptly instead of waiting
+	// for the next heartbeat tick.
+	e.notifyReplicators()
 }
 
-// waitForCommit polls quorum state until entry.Index is committed or timeout.
-func (e *Engine) waitForCommit(entry raft.LogEntry) bool {
-	ticker := time.NewTicker(tickInterval)
-	defer ticker.Stop()
-	timeout := time.NewTimer(quorumPollTimeout)
-	defer timeout.Stop()
-
-	for {
-		localLatest := e.raftLog.LatestIndex()
-		localTerm := e.raftLog.TermAt(localLatest)
-		term := e.node.CurrentTerm()
-
-		e.node.AdvanceCommitIndex(localLatest, localTerm, term)
-
-		commitIndex, _ := e.node.CommitAndApplyBoundary()
-		if commitIndex >= entry.Index {
-			return true
-		}
-
-		select {
-		case <-timeout.C:
-			return false
-		case <-ticker.C:
-			// continue polling
+// fireCommittedWaiters resolves every waiter whose index is now committed,
+// removing it from the pending list. Called from the control loop after commit
+// advancement.
+func (e *Engine) fireCommittedWaiters(commitIndex int) {
+	if len(e.waiters) == 0 {
+		return
+	}
+	kept := e.waiters[:0]
+	for _, w := range e.waiters {
+		if w.index <= commitIndex {
+			w.resultCh <- nil
+		} else {
+			kept = append(kept, w)
 		}
 	}
+	e.waiters = kept
+}
+
+// sweepExpiredWaiters fails any waiter past its deadline with ErrCommitTimeout.
+func (e *Engine) sweepExpiredWaiters(now time.Time) {
+	if len(e.waiters) == 0 {
+		return
+	}
+	kept := e.waiters[:0]
+	for _, w := range e.waiters {
+		if now.After(w.deadline) {
+			w.resultCh <- ErrCommitTimeout
+		} else {
+			kept = append(kept, w)
+		}
+	}
+	e.waiters = kept
+}
+
+// failAllWaiters resolves every pending waiter with err (used on stepdown and
+// shutdown). Leaves the waiter list empty.
+func (e *Engine) failAllWaiters(err error) {
+	for _, w := range e.waiters {
+		w.resultCh <- err
+	}
+	e.waiters = e.waiters[:0]
+}
+
+// ---- Control loop tick ----
+
+// onTick drives the Figure 2 "Rules for Servers" for the local role, without
+// ever blocking on an RPC.
+//
+//   - Leader: advance commit index from the refreshed matchIndex quorum, fire
+//     any newly-committed waiters, apply, and compact. Heartbeats and retries
+//     are handled continuously by the per-peer replication goroutines, so the
+//     tick does no network I/O.
+//   - Follower/Candidate: if the randomized election timeout elapsed with no
+//     contact, start an election.
+//
+// Both roles apply committed entries and expire stale waiters.
+func (e *Engine) onTick() {
+	if e.node.IsLeader() {
+		localLatest := e.raftLog.LatestIndex()
+		e.node.AdvanceCommitIndex(localLatest, e.raftLog.TermAt, e.node.CurrentTerm())
+		commitIndex, _ := e.node.CommitAndApplyBoundary()
+		e.fireCommittedWaiters(commitIndex)
+	} else if e.node.TimeSinceContact() >= e.electionTimeout {
+		e.runElection()
+	}
+
+	e.applyCommitted()
+	e.maybeCompact()
+	e.sweepExpiredWaiters(time.Now())
+}
+
+// handleStepDown reacts to a higher term observed by a replication goroutine:
+// step down to follower, stop the replicators, and fail all pending proposals.
+func (e *Engine) handleStepDown(higherTerm int) {
+	if higherTerm <= e.node.CurrentTerm() && !e.node.IsLeader() {
+		return // already handled / stale signal
+	}
+	log.Printf("[ENGINE] Stepping down: observed higher term %d", higherTerm)
+	if err := e.node.BecomeFollower(higherTerm, 0); err != nil {
+		log.Printf("[ENGINE] Stepdown persist failed: %v", err)
+	}
+	e.stopReplicators()
+	e.failAllWaiters(ErrNotLeader)
 }
 
 // applyCommitted applies all entries between LastApplied and CommitIndex.
@@ -194,11 +293,13 @@ func (e *Engine) applyCommitted() {
 	}
 }
 
-// onTick runs on every ticker cycle for background maintenance.
-// On followers: advance application of committed entries pushed by leader.
-func (e *Engine) onTick() {
-	if !e.node.IsLeader() {
-		e.applyCommitted()
+// maybeCompact triggers a snapshot + WAL truncation when the log has grown past
+// the threshold. Driven from the tick so a leader still compacts while a lagging
+// follower is unreachable — the situation that later forces an InstallSnapshot.
+func (e *Engine) maybeCompact() {
+	commitIndex, _ := e.node.CommitAndApplyBoundary()
+	if e.raftLog.NeedsCompaction(commitIndex) {
+		e.compact(commitIndex)
 	}
 }
 
@@ -215,10 +316,181 @@ func (e *Engine) compact(commitIndex int) {
 		return
 	}
 
-	if err := e.raftLog.TruncateBeforeIndex(commitIndex); err != nil {
+	if err := e.raftLog.TruncateBeforeIndex(commitIndex, term); err != nil {
 		log.Printf("[ENGINE] WAL truncation failed: %v", err)
 		return
 	}
 
 	log.Printf("[ENGINE] Compacted log up to index %d", commitIndex)
+}
+
+// ---- Elections ----
+
+// runElection conducts one election attempt (§5.2): transition to candidate,
+// bump the term, vote for self, request votes from all peers in parallel, and
+// become leader on a majority. A newer term observed in any response steps us
+// back down to follower. Regardless of outcome, a fresh randomized timeout is
+// armed so a failed election retries after a different delay.
+//
+// Vote gathering is done inline (bounded, one round) rather than via the
+// per-peer replicators, which only run while we are leader.
+func (e *Engine) runElection() {
+	term, err := e.node.BecomeCandidate()
+	if err != nil {
+		log.Printf("[ENGINE] Election abort: cannot persist candidate state: %v", err)
+		e.resetElectionTimeout()
+		return
+	}
+
+	lastLogIndex := e.raftLog.LatestIndex()
+	lastLogTerm := e.raftLog.LatestTerm()
+	req := raft.RequestVoteRequest{
+		Term:         term,
+		CandidateID:  e.node.NodeID(),
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	highestTerm := term
+	won := false
+
+	for peerID, addr := range e.peers {
+		wg.Add(1)
+		go func(pid int, a string) {
+			defer wg.Done()
+			resp, ok := e.replicator.RequestVoteFrom(pid, a, req)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			if resp.Term > highestTerm {
+				highestTerm = resp.Term
+			}
+			mu.Unlock()
+			if resp.VoteGranted {
+				if e.node.RecordVoteAndCheckMajority(term) {
+					mu.Lock()
+					won = true
+					mu.Unlock()
+				}
+			}
+		}(peerID, addr)
+	}
+	wg.Wait()
+
+	e.resetElectionTimeout()
+
+	if highestTerm > term {
+		log.Printf("[ENGINE] Election lost: observed higher term %d", highestTerm)
+		if err := e.node.BecomeFollower(highestTerm, 0); err != nil {
+			log.Printf("[ENGINE] Stepdown persist failed: %v", err)
+		}
+		return
+	}
+
+	// Assume leadership only if we won AND BecomeLeader confirms we are still a
+	// candidate in this election's term (atomic check inside BecomeLeader,
+	// closing the stepdown race).
+	if won && e.node.BecomeLeader(term, lastLogIndex) {
+		// Append a no-op entry in our new term (§8) so prior-term entries can
+		// reach the commit frontier without waiting for the first client write.
+		if noop, err := raft.EncodeCommand(raft.Command{Op: raft.OpNoop}); err != nil {
+			log.Printf("[ENGINE] Failed to encode leader no-op: %v", err)
+		} else if _, err := e.raftLog.AppendLeader(noop, term); err != nil {
+			log.Printf("[ENGINE] Failed to append leader no-op: %v", err)
+		}
+
+		// Start the per-peer replication goroutines; they immediately send a
+		// first round that both ships the no-op and asserts authority.
+		e.startReplicators()
+	}
+}
+
+// ---- Per-peer replication goroutine lifecycle ----
+
+// startReplicators launches one replication goroutine per peer. Idempotent: if
+// replicators are already running it does nothing. Called on becoming leader.
+func (e *Engine) startReplicators() {
+	if len(e.replicators) > 0 {
+		return
+	}
+	term := e.node.CurrentTerm()
+	for peerID, addr := range e.peers {
+		pr := &peerReplicator{
+			engine: e,
+			peerID: peerID,
+			addr:   addr,
+			term:   term,
+			notify: make(chan struct{}, 1),
+			stop:   make(chan struct{}),
+		}
+		e.replicators[peerID] = pr
+		e.replWG.Add(1)
+		go pr.run(&e.replWG)
+	}
+	log.Printf("[ENGINE] Started %d replication goroutines for term %d", len(e.replicators), term)
+}
+
+// stopReplicators signals all replication goroutines to exit and waits for them.
+// Idempotent. Called on stepdown and shutdown.
+func (e *Engine) stopReplicators() {
+	if len(e.replicators) == 0 {
+		return
+	}
+	for _, pr := range e.replicators {
+		close(pr.stop)
+	}
+	e.replWG.Wait()
+	e.replicators = make(map[int]*peerReplicator)
+}
+
+// notifyReplicators nudges every replication goroutine that new work is
+// available. The per-peer notify channel is buffered depth 1, so a nudge is
+// coalesced rather than queued — a replicator always sends the latest log state.
+func (e *Engine) notifyReplicators() {
+	for _, pr := range e.replicators {
+		select {
+		case pr.notify <- struct{}{}:
+		default: // already pending
+		}
+	}
+}
+
+// reportHigherTerm is called by a replication goroutine that saw a follower on a
+// newer term. It forwards the term to the control loop for stepdown. Non-blocking.
+func (e *Engine) reportHigherTerm(term int) {
+	select {
+	case e.stepDownCh <- term:
+	default:
+	}
+}
+
+// buildSnapshotRequest assembles an InstallSnapshot RPC from the latest on-disk
+// snapshot. ok is false if no snapshot exists yet. Safe for concurrent use by
+// replication goroutines: it only reads immutable snapshot state and node/log
+// accessors that take their own locks.
+func (e *Engine) buildSnapshotRequest() (raft.InstallSnapshotRequest, bool) {
+	snap, err := e.snapshots.Read()
+	if err != nil || snap == nil {
+		if err != nil {
+			log.Printf("[ENGINE] Cannot read snapshot for shipping: %v", err)
+		}
+		return raft.InstallSnapshotRequest{}, false
+	}
+
+	data, err := snap.EncodeState()
+	if err != nil {
+		log.Printf("[ENGINE] Cannot encode snapshot for shipping: %v", err)
+		return raft.InstallSnapshotRequest{}, false
+	}
+
+	return raft.InstallSnapshotRequest{
+		Term:              e.node.CurrentTerm(),
+		LeaderID:          e.node.NodeID(),
+		LastIncludedIndex: snap.Meta.LastIncludedIndex,
+		LastIncludedTerm:  snap.Meta.LastIncludedTerm,
+		Data:              data,
+	}, true
 }
