@@ -73,6 +73,10 @@ func (m *MemoryStateMachine) Apply(index int, cmd raft.Command) error {
 		delete(m.data, cmd.Key)
 		log.Printf("[STATE MACHINE] index=%d delete %q", index, cmd.Key)
 
+	case raft.OpNoop:
+		// Leader's post-election no-op (§8): advances the commit frontier without
+		// mutating state. Nothing to apply.
+
 	default:
 		return fmt.Errorf("unknown op %q at index %d", cmd.Op, index)
 	}
