@@ -24,19 +24,23 @@ type Server struct {
 	node         leaderChecker
 	proposals    chan<- engine.Proposal
 	stateMachine store.StateMachine
-	raftLog      appendReceiver
+	rpc          rpcHandler
 }
 
-// leaderChecker is the subset of RaftNode the transport layer needs.
+// leaderChecker is the subset of RaftNode the client-facing handlers need.
 type leaderChecker interface {
 	IsLeader() bool
 	NodeID() int
 }
 
-// appendReceiver is the subset of RaftLog the internal append handler needs.
-type appendReceiver interface {
-	AppendFollower(entry raft.LogEntry) error
-	LatestIndex() int
+// rpcHandler owns the full AppendEntries and RequestVote receiver logic (term
+// checks, consistency check, commit advancement, vote decision). The transport
+// layer stays thin: it decodes the request, calls this, and encodes the
+// response. All consensus logic lives behind this seam in the raft package.
+type rpcHandler interface {
+	HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse
+	HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse
+	HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse
 }
 
 // NewServer wires up the HTTP server dependencies.
@@ -44,13 +48,13 @@ func NewServer(
 	node leaderChecker,
 	proposals chan<- engine.Proposal,
 	sm store.StateMachine,
-	raftLog appendReceiver,
+	rpc rpcHandler,
 ) *Server {
 	return &Server{
 		node:         node,
 		proposals:    proposals,
 		stateMachine: sm,
-		raftLog:      raftLog,
+		rpc:          rpc,
 	}
 }
 
@@ -60,6 +64,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/get", s.handleGet)
 	mux.HandleFunc("/delete", s.handleDelete)
 	mux.HandleFunc("/internal/append", s.handleInternalAppend)
+	mux.HandleFunc("/internal/vote", s.handleInternalVote)
+	mux.HandleFunc("/internal/snapshot", s.handleInternalSnapshot)
 }
 
 // ---- Public client-facing handlers ----
@@ -157,21 +163,60 @@ func (s *Server) handleInternalAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req raft.AppendEntryRequest
+	var req raft.AppendEntriesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if err := s.raftLog.AppendFollower(req.Entry); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	// All term checks, the log-matching consistency check, and commit
+	// advancement happen inside the raft package. The response carries the
+	// follower's term and (on rejection) the conflict hints the leader uses
+	// to backtrack nextIndex.
+	resp := s.rpc.HandleAppendEntries(req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleInternalVote is the RequestVote endpoint. Like the append handler, it is
+// thin: the term check, up-to-date restriction, and vote persistence all live in
+// the raft package.
+func (s *Server) handleInternalVote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
 
-	resp := raft.AppendEntryResponse{
-		Success:    true,
-		MatchIndex: req.Entry.Index,
+	var req raft.RequestVoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
+
+	resp := s.rpc.HandleRequestVote(req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleInternalSnapshot is the InstallSnapshot endpoint, used when the leader
+// has compacted past this follower's nextIndex. Thin as ever: decode, delegate
+// to the raft package, encode.
+func (s *Server) handleInternalSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req raft.InstallSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := s.rpc.HandleInstallSnapshot(req)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
