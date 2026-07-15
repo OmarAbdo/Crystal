@@ -1,14 +1,32 @@
-current limitation in crystal.
-1. Our WAL log is so far only in memory.
-2. how we define nodes and let them know each other is done by a hardcoded manually written cmd line by us humans.
-   this is too primitive way of cluster definition and service discovery.
-3. the /internal api is not really internal
-4. actually RAFT?
+Crystal — working notes
+========================
 
+For the real documentation see README.md and docs/ (ARCHITECTURE.md, RAFT.md).
+This file is just a running scratchpad.
 
-BUGS
+RESOLVED (were the original "current limitations")
+--------------------------------------------------
+1. WAL was in-memory only        -> now a durable framed WAL, fsync'd, with
+                                    crash recovery (internal/raft/log.go).
+2. Node-1-is-leader hardcode      -> removed; real randomized leader election (§5.2).
+3. "Is this actually Raft?"       -> yes now: Figure 2 + §5 safety + §7 compaction,
+                                    verified by unit + integration tests.
+
+STILL PRIMITIVE (open)
+----------------------
+- Cluster membership + service discovery are still a hand-written -peers CLI list.
+  No dynamic membership (§6 joint consensus).
+- Reads are served from any node's state machine -> can be slightly stale under
+  a partition. No read leases / linearizable reads yet.
+- No pre-vote: a rejoining partitioned node can still force a term bump.
+- The /internal endpoints share the same HTTP server as client traffic.
+
+NEXT
 ----
-1. The following worked. when i killed the leader and reran it with a follower node id
-go run . -id=2 -port=8002 -peers=2:localhost:8002,3:localhost:8003     
-go run . -id=2 -port=8001 -peers=2:localhost:8002,3:localhost:8003     
+- Storage engine: swap the in-memory map for an LSM-tree behind the existing
+  store.StateMachine interface (Apply/Get/Snapshot/Restore) — zero raft changes.
+
+NOTE
 ----
+> Go has a battle-tested consensus library (hashicorp/raft, etcd/raft). Crystal
+  reimplements Raft on purpose — the point is understanding, not reuse.

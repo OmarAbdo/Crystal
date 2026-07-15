@@ -1,174 +1,197 @@
-# Crystal - Distributed Key-Value Store
+# Crystal — a distributed key-value store built on Raft
 
 <p align="center">
   <img src="logo.png" alt="Crystal Logo" width="200">
 </p>
 
-Crystal is a distributed key-value store implementing RAFT consensus algorithm with log replication, written in Golang.
+Crystal is a small, readable, **paper-faithful** implementation of the
+[Raft consensus algorithm](https://raft.github.io/raft.pdf) in Go, wrapped
+around a replicated key-value store. It is written to be *read*: every
+consensus decision is traceable to a section of Ongaro & Ousterhout's
+_"In Search of an Understandable Consensus Algorithm"_ (the paper lives in the
+repo root), and the code is layered so each concern sits in one place.
 
-## Features
+> _"Raft separates leader election, log replication, and safety … and it
+> reduces the degree of nondeterminism and the ways servers can be inconsistent
+> with each other."_ — Raft paper, §1
 
-### Implemented Features
-- **RAFT Consensus**: Basic RAFT implementation with leader election
-- **Log Replication**: Write operations are replicated across cluster nodes
-- **Leader-Based Writes**: Only the cluster leader can accept write operations
-- **Internal Communication**: REST-based communication between nodes
-- **Thread Safety**: Concurrent-safe operations using RWMutex
-- **Configuration Management**: Command-line configuration for nodes and peers
+If you want the guided tour, start with **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+(how the pieces fit) and **[docs/RAFT.md](docs/RAFT.md)** (how the code maps to
+the paper, with the safety intuition spelled out).
 
-### Current Limitations
-- Nodes communicate via internal REST API endpoints (push-based, no events or pub/sub)
-- Node discovery requires manual command-line configuration
-- All data is stored in-memory (no persistent storage)
+---
 
-## Getting Started
+## What it does
 
-### Prerequisites
+A Crystal cluster is a set of nodes that agree on an ordered log of write
+commands and apply them to identical copies of a key-value map. Clients `set`,
+`get`, and `delete` keys; the cluster keeps the data consistent and available as
+long as a majority of nodes are up — including across leader crashes.
 
-- Go 1.24.3 or higher
+### Implemented (feature-complete against Figure 2 + §5 + §7)
 
-### Installation
+| Area | What's there |
+|------|--------------|
+| **Leader election** | Randomized election timeouts (§5.2); no hardcoded leader; step-down on higher term everywhere |
+| **Log replication** | AppendEntries with `prevLogIndex/prevLogTerm` matching, batched entries, and §5.3 conflict-hint backtracking |
+| **Safety** | Election restriction (§5.4.1), the Figure 8 commit rule (§5.4.2), one-vote-per-term, persist-before-respond |
+| **Durability** | Framed write-ahead log, fsync on append, crash recovery with partial-frame truncation |
+| **Log compaction** | State-machine snapshots + WAL truncation, and the InstallSnapshot RPC (Figure 13) to catch up lagging followers |
+| **Concurrency** | etcd-style single-writer control loop + one replication goroutine per peer; non-blocking client proposals |
+| **Persistence** | `currentTerm` / `votedFor` survive restarts (losing them breaks safety) |
+| **Tests** | Unit tests for the tricky invariants + an integration suite that drives a real 3-node cluster over HTTP |
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/OmarAbdo/Crystal.git
-   cd Crystal
-   ```
+### Not yet built
 
-2. Run the application:
-   ```bash
-   go run main.go
-   ```
+- **Storage engine.** The state machine is an in-memory `map[string]string`. The
+  `StateMachine` interface is the seam for a future LSM-tree backend — see the
+  roadmap below.
+- **Dynamic membership** (§6 joint consensus) — the cluster set is fixed at startup.
+- **Pre-vote / leadership transfer** — a rejoining node can still force a term bump.
+- **Service discovery** — peers are passed on the command line.
 
-### Configuration
+---
 
-The application supports command-line flags for configuration:
+## Quick start
 
-```bash
-go run main.go -id=1 -port=8080 -peers="2:localhost:8002,3:localhost:8003"
-```
-
-- `-id`: Unique ID for this node (default: 1)
-- `-port`: Port for this node to listen on (default: 8080)
-- `-peers`: Comma-separated list of peer ID:addr (e.g., 2:localhost:8002,3:localhost:8003)
-
-By default, Node 1 starts as the leader. Other nodes start as followers.
-
-### Testing the API
-
-Here are some curl commands to test the API:
-
-**Set a value (should throw an error due to incorrect JSON value type):**
+**Prerequisites:** Go 1.24+.
 
 ```bash
-curl -i -X POST -H "Content-Type: application/json" -d "{\"key\": \"test\", \"value\": 12345}" http://localhost:8080/set
+git clone https://github.com/OmarAbdo/Crystal.git
+cd Crystal
+go build ./...
 ```
 
-**Set a value (correct JSON format):**
+Run a three-node cluster locally, each node in its own terminal with its own
+data directory:
 
 ```bash
-curl -i -X POST -H "Content-Type: application/json" -d "{\"key\": \"test\", \"value\": \"12345\"}" http://localhost:8080/set
+# node 1
+go run ./cmd/crystal -id=1 -port=8001 -data-dir=data/n1 \
+  -peers="2:localhost:8002,3:localhost:8003"
+
+# node 2
+go run ./cmd/crystal -id=2 -port=8002 -data-dir=data/n2 \
+  -peers="1:localhost:8001,3:localhost:8003"
+
+# node 3
+go run ./cmd/crystal -id=3 -port=8003 -data-dir=data/n3 \
+  -peers="1:localhost:8001,2:localhost:8002"
 ```
 
-**Get a value:**
+Within a few hundred milliseconds one node wins an election and becomes leader.
+
+### Flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-id` | `1` | Unique integer node ID (must be unique in the cluster) |
+| `-port` | `8080` | TCP port to listen on |
+| `-data-dir` | `data` | Directory for this node's WAL, metadata, and snapshot |
+| `-peers` | `""` | Comma-separated `id:host:port` list of the *other* nodes |
+| `-compaction-threshold` | `0` (→ 1000) | Cached-entry count that triggers a snapshot + WAL truncation |
+
+### Talking to the cluster
+
+Writes must go to the **leader**; a follower replies `421 Misdirected Request`
+telling you which node to route to.
 
 ```bash
-curl -i -X GET "http://localhost:8080/get?key=test"
+# set a key (on the leader)
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"key":"color","value":"crystal"}' http://localhost:8001/set
+
+# read it back (any node serves reads)
+curl -i "http://localhost:8001/get?key=color"
+
+# delete it
+curl -i -X POST -H "Content-Type: application/json" \
+  -d '{"key":"color"}' http://localhost:8001/delete
 ```
 
-**Try to write to a follower node (should fail):**
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/set` | POST | Set a key (leader only) |
+| `/get` | GET | Read a key (any node) |
+| `/delete` | POST | Delete a key (leader only) |
+| `/internal/append` | POST | AppendEntries RPC receiver (node-to-node) |
+| `/internal/vote` | POST | RequestVote RPC receiver (node-to-node) |
+| `/internal/snapshot` | POST | InstallSnapshot RPC receiver (node-to-node) |
+
+---
+
+## Layout
+
+```
+cmd/crystal/main.go        composition root — wires everything, no logic
+internal/
+  config/                  flag parsing, per-node path derivation
+  raft/
+    node.go                consensus state: terms, votes, elections, commit rule
+    log.go                 durable framed WAL + in-memory cache + compaction
+    replicator.go          outbound AppendEntries/RequestVote/InstallSnapshot
+    types.go               LogEntry, Command, RPC request/response shapes
+  engine/
+    engine.go              single-writer control loop (commit/apply/elect)
+    replicator_loop.go     one long-lived replication goroutine per peer
+    errors.go              ErrNotLeader / ErrCommitTimeout
+  store/
+    statemachine.go        StateMachine interface + in-memory implementation
+    snapshot.go            durable snapshot read/write
+  transport/http.go        thin HTTP handlers, delegate to engine/raft
+  integration/             real-cluster tests (build tag: integration)
+docs/                      architecture + Raft-mapping walkthroughs
+```
+
+The dependency arrow is one-directional: `store` imports `raft`, never the
+reverse. `raft` knows nothing about HTTP or key-value semantics; it moves opaque
+`[]byte` commands. That boundary is what lets the storage backend change without
+touching consensus.
+
+---
+
+## Testing
 
 ```bash
-curl -i -X POST -H "Content-Type: application/json" -d "{\"key\": \"test\", \"value\": \"value\"}" http://localhost:8002/set
+go test ./...                                    # fast, hermetic unit tests
+go test -tags integration ./internal/integration -v   # spins up a real 3-node cluster
 ```
 
-## Project Structure
+The integration suite builds the binary, launches OS processes, elects a leader,
+kills it, and asserts re-election, committed-data survival, follower
+convergence, and snapshot-based catch-up. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#testing-strategy) for the
+philosophy (unit tests pin invariants; integration tests prove the whole thing
+actually agrees).
 
-```
-Crystal/
-├── main.go          # Application entry point and RAFT initialization
-├── config.go        # Configuration parsing and management
-├── raft.go          # RAFT consensus implementation
-├── store.go         # Key-value store with log replication
-├── handlers.go      # HTTP handlers for API endpoints
-├── go.mod           # Go module file
-├── logo.png         # Project logo
-└── README.md        # This file
-```
+> **Note on `-race`:** the race detector needs cgo, which isn't wired up on the
+> primary dev box (Windows, no C toolchain). Run `-race` in Linux CI if you add it.
 
-### Component Overview
+---
 
-- **main.go**: Application entry point that initializes the store, RAFT node, and HTTP handlers
-- **config.go**: Handles command-line flag parsing for node configuration
-- **raft.go**: Implements RAFT consensus with leader/follower/candidate roles
-- **store.go**: Key-value store with append-only log and peer replication
-- **handlers.go**: HTTP handlers for API endpoints and internal communication
+## Roadmap
 
-### API Endpoints
+Crystal was built consensus-first: get agreement provably right, *then* make the
+thing it agrees about interesting.
 
-- **POST /set**: Set a key-value pair (only works on leader)
-- **GET /get**: Get a value by key
-- **POST /internal/append**: Internal endpoint for log replication
+- [x] **Consensus core** — elections, replication, safety (Figure 2, §5)
+- [x] **Durability** — framed WAL, fsync, crash recovery
+- [x] **Compaction** — snapshots + InstallSnapshot (§7)
+- [x] **Concurrency** — single-writer loop + per-peer replicators
+- [ ] **Storage engine** — swap the in-memory map for an LSM-tree
+      (MemTable → SSTables, background compaction) behind the same
+      `StateMachine` interface
+- [ ] **Dynamic membership** — §6 joint consensus
+- [ ] **Pre-vote & leadership transfer** — avoid needless term bumps
+- [ ] **Service discovery** — stop hand-writing the peer list
 
-## Architecture
-
-Crystal uses a simple RAFT-based architecture:
-
-1. **Leader Election**: Node 1 starts as leader by default
-2. **Write Consistency**: All writes go through the leader and are replicated to followers
-3. **Log Replication**: Operations are logged and replicated to peer nodes
-4. **Read Operations**: Reads can be served by any node
-
-## Development Roadmap
-
-### Phase 1: Basic RAFT Implementation (Current)
-- [x] RAFT node roles (Leader, Follower, Candidate)
-- [x] Leader-based write operations
-- [x] Log replication between nodes
-- [x] Command-line configuration
-- [x] Basic HTTP API
-
-### Phase 2: Enhanced RAFT Features
-- [ ] Proper RAFT election mechanism
-- [ ] Log persistence
-- [ ] Node failure detection
-- [ ] Automatic leader election
-
-### Phase 3: Storage Engine
-- [ ] LSM Tree implementation
-- [ ] Persistent storage
-- [ ] Write-ahead logging (WAL)
-- [ ] Compaction
-
-### Phase 4: Advanced Distributed Features
-- [ ] Dynamic node discovery
-- [ ] Automatic node configuration
-- [ ] Event-driven architecture
-- [ ] Monitoring and metrics
-
-### Phase 5: Production Features
-- [ ] Data persistence
-- [ ] Backup and recovery
-- [ ] Load balancing
-- [ ] Client libraries for different languages
-
-## Contributing
-
-We welcome contributions to the Crystal project! Here's how you can help:
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-Please make sure to follow the existing code style and add tests for new functionality.
+---
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).
 
 ## Contact
 
-- Repository: [https://github.com/OmarAbdo/Crystal](https://github.com/OmarAbdo/Crystal)
-- Issues: [Report bugs or request features](https://github.com/OmarAbdo/Crystal/issues)
+- Repository: <https://github.com/OmarAbdo/Crystal>
+- Issues: <https://github.com/OmarAbdo/Crystal/issues>
