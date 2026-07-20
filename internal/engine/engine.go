@@ -82,6 +82,11 @@ type Engine struct {
 	// The control loop drains it and steps down. Buffered so a replicator never
 	// blocks reporting it.
 	stepDownCh chan int
+
+	// fatalf halts the node on a condition from which it cannot continue
+	// correctly. It is a field only so tests can observe the halt instead of
+	// killing the test binary; in production it is log.Fatalf.
+	fatalf func(format string, args ...any)
 }
 
 // New creates an Engine. The proposals channel is exposed via ProposalQueue().
@@ -103,6 +108,7 @@ func New(
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano() + int64(node.NodeID()))),
 		replicators:  make(map[int]*peerReplicator),
 		stepDownCh:   make(chan int, len(cfg.Peers)+1),
+		fatalf:       log.Fatalf,
 	}
 	e.resetElectionTimeout()
 	return e
@@ -268,28 +274,48 @@ func (e *Engine) handleStepDown(higherTerm int) {
 }
 
 // applyCommitted applies all entries between LastApplied and CommitIndex.
+//
+// Every failure here is fatal, and lastApplied is advanced only after an entry
+// has actually been applied. This is not defensiveness — it is the only way to
+// hold State Machine Safety (§5.4.3), which requires that every replica apply the
+// same entries in the same order. A replica that skips an entry and advances
+// anyway has diverged from the cluster, and Raft has no mechanism to detect or
+// repair that: the log will look consistent forever while the state machine
+// underneath it is wrong, and reads will be served from it.
+//
+// The three conditions below are all unrecoverable at runtime, so the node stops:
+//
+//   - a missing entry means the log lost something it had promised to keep,
+//   - an undecodable command means the WAL is corrupt at that index,
+//   - an Apply error means the entry did not take effect.
+//
+// A crashed node rejoins and catches up from the leader. A diverged node does
+// not, and nothing tells its operator it happened. Crashing is the safer failure.
 func (e *Engine) applyCommitted() {
 	commitIndex, lastApplied := e.node.CommitAndApplyBoundary()
 
 	for lastApplied < commitIndex {
-		nextApply := e.node.AdvanceLastApplied()
-		entry, ok := e.raftLog.GetEntry(nextApply)
+		next := lastApplied + 1
+
+		entry, ok := e.raftLog.GetEntry(next)
 		if !ok {
-			log.Printf("[ENGINE] Missing log entry at index %d — skipping", nextApply)
-			continue
+			e.fatalf("[ENGINE] log entry %d is missing but commitIndex is %d; "+
+				"cannot apply without diverging from the cluster", next, commitIndex)
+			return
 		}
 
 		cmd, err := raft.DecodeCommand(entry.Command)
 		if err != nil {
-			log.Printf("[ENGINE] Corrupt command at index %d: %v", nextApply, err)
-			continue
+			e.fatalf("[ENGINE] corrupt command in committed entry %d: %v", next, err)
+			return
 		}
 
-		if err := e.stateMachine.Apply(nextApply, cmd); err != nil {
-			log.Printf("[ENGINE] State machine error at index %d: %v", nextApply, err)
+		if err := e.stateMachine.Apply(next, cmd); err != nil {
+			e.fatalf("[ENGINE] state machine failed to apply committed entry %d: %v", next, err)
+			return
 		}
 
-		_, lastApplied = e.node.CommitAndApplyBoundary()
+		lastApplied = e.node.AdvanceLastApplied()
 	}
 }
 
