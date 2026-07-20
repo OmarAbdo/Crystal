@@ -94,7 +94,8 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
 
 ## Open work
 
-- [ ] **F19 — a leader that loses its quorum never steps down.** *(found
+- [x] **F19 — a leader that loses its quorum never steps down.** *(done
+      `66b5b4d`, with F12 as planned — they share the per-peer ack machinery)* *(found
       2026-07-21 while writing the F18 minority test; not in the original review)*
       Quorum counting is correct — no minority node ever wins an election — but
       the incumbent keeps `Role == Leader` indefinitely after being cut off. Not a
@@ -144,7 +145,18 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
       handler and the comment in `errors.go`.
       *Test:* `TestHandleSet_RedirectsToKnownLeader`.
 
-- [ ] **F12 — no linearizable reads at all.**
+- [x] **F12 — no linearizable reads at all.** *(done `66b5b4d`)* — ReadIndex
+      with round-sequence barriers; `/get` linearizable by default,
+      `?consistency=stale` opts out; refuses rather than serving stale.
+      The recorded in-flight-ack trap is enforced and pinned by
+      `TestReadIndex_IgnoresAcksFromRoundsStartedBeforeTheRead`.
+
+      **Division of labour worth remembering:** CheckQuorum only reacts after a
+      full grace period, so for up to one election timeout after a partition the
+      old leader still believes it leads. ReadIndex covers precisely that window.
+      Neither alone is sufficient.
+
+      Original analysis:
       ([http.go:136](../internal/transport/http.go#L136)) `handleGet` reads the
       local state machine with no leader check whatsoever — any follower answers
       from its own lagging state, and a deposed leader serves confidently stale
