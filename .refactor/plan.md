@@ -10,12 +10,16 @@ used. Every fix here is re-derived from scratch on clean `3ce740d`. Do not
 
 ## Invariants for this work
 
-- One finding per commit. Never combine two.
+- One finding per commit — unless splitting would leave the tree uncompilable or
+  in a state that is incoherent rather than merely incomplete. That happened
+  twice (F1b, and all of Phase 4); both are recorded where they occurred.
 - Test-first: each step names a test that fails before the fix and passes after.
-- After each step: `go build ./...`, `go vet ./...`, `go test ./...`.
-  A failing test is a hard stop — revert, document, ask.
-- Findings are numbered F1–F18 and keep those numbers forever, including in
-  commit messages (`fix(raft): F2 fsync persistent state`).
+  Where the test cannot distinguish fixed from broken, say so rather than
+  claiming coverage — see the InstallSnapshot note in F1.
+- After each step: `go build ./...`, `go vet ./...`, `go test ./...`, plus the
+  harness and the integration suite. A failing test is a hard stop.
+- Findings keep their numbers forever, including in commit messages
+  (`fix(raft): F2 fsync persistent state`). F19 and F1c were added mid-flight.
 
 ## Status legend
 
@@ -23,281 +27,97 @@ used. Every fix here is re-derived from scratch on clean `3ce740d`. Do not
 
 ---
 
-## Phase 0 — Durability and fail-stop
+## Phases 0–4 — COMPLETE
 
-No structural change. Highest safety-per-line-changed in the tree. These three
-are what stand between a power cut and a silently divergent cluster.
+All entries below are landed on `raft-conformance-fixes`. Build, vet, unit,
+harness and integration suites green after every commit. Original bug analysis is
+in the commit messages, which are the durable record; these are one-liners.
 
-- [x] **F2 — fsync persistent state.** *(done `d8434f1`)* — new `internal/fsutil`
-      (`WriteFileAtomic`, `SyncDir` + Windows no-op behind build tags), applied to
-      raft metadata, snapshot writes, and the WAL rewrite rename. 6 new tests. `savePersistentStateLocked`
-      ([node.go:629](../internal/raft/node.go#L629)) does `os.WriteFile` + `Rename`
-      with no `Sync` on the temp file and no fsync of the containing directory.
-      Figure 2's "updated on stable storage before responding to RPCs" is not
-      satisfied, so a crash after granting a vote can resurrect the node with
-      `votedFor = -1` in the same term → two leaders → Election Safety violated.
-      *Fix:* open/write/`Sync`/`Close`/`Rename`/fsync-dir. Add a shared
-      `fsyncDir` helper; apply it to `SnapshotManager.Write`
-      ([snapshot.go:77](../internal/store/snapshot.go#L77)) and
-      `rewriteWALLocked` ([log.go:572](../internal/raft/log.go#L572)) too — both
-      rename without durably committing the directory entry.
-      *Test:* `TestSavePersistentStateIsDurable` (inject a writer that records
-      the call order; assert Sync precedes Rename).
-      *Blast radius:* every term change and vote. Low risk, pure addition.
+### Phase 0 — Durability and fail-stop ✅
+- [x] **F2** `7e3aa53` — persistent state was atomic but never fsynced. New
+      `internal/fsutil` (write→fsync→rename→fsync-dir) applied to raft metadata,
+      snapshots and the WAL rewrite. `SyncDir` is a documented no-op on Windows.
+- [x] **F3** `71ccf2a` — term/vote adopted in memory before being persisted, no
+      rollback. `stateStore` seam + `commitPersistentLocked` (save, then adopt).
+- [x] **F5** `e23918b` — compaction snapshotted at `commitIndex`, not
+      `lastApplied`; also refused to compact on an unresolvable term.
+- [x] **F6** `08836b4` — apply failures skipped entries and advanced
+      `lastApplied` anyway. Now fatal, via a `fatalf` seam.
+- [x] **F17** `ebabf61` — snapshot log-reset ran before the persist that
+      justified it. Reordered; `RestoreOffset` now reconciles the snapshot/WAL
+      overlap that persist-first legitimizes.
 
-- [x] **F3 — persist before mutate.** *(done `71ccf2a`)* — `stateStore` seam +
-      `commitPersistentLocked` (Save first, adopt on success); applied to
-      `BecomeCandidate`, `HandleRequestVote`, `BecomeFollower`. No-op changes skip
-      the write so a same-term stepdown can't be blocked by a broken disk. 4 tests. `BecomeCandidate`
-      ([node.go:405](../internal/raft/node.go#L405)) increments the term, votes for
-      itself, and flips to Candidate *before* calling
-      `savePersistentStateLocked`, with no rollback on failure. On persist error
-      the node keeps an unpersisted term it has already voted in — after a crash
-      it can vote again in that same term.
-      *Fix:* build the candidate `PersistentState` value, persist it, and only
-      then commit it to `rn.persistent` and flip `Role`. Same shape for the vote
-      grant in `HandleRequestVote` ([node.go:473](../internal/raft/node.go#L473)),
-      which currently sets `VotedFor` in memory and then reports
-      `VoteGranted: false` if the persist fails.
-      *Test:* `TestBecomeCandidate_PersistFailureLeavesStateUnchanged`,
-      `TestHandleRequestVote_PersistFailureDoesNotRecordVote`.
-      *Blast radius:* election path. Needs a persist seam on `RaftNode` to
-      inject failure — introduce a small `stateStore` interface.
+### Phase 1 — Atomic term handling ✅
+- [x] **F11** `d2081b0` — the "locks are never held together" invariant was
+      already false. Replaced with the order `rn.mu → rl.mu`, safe by
+      construction because `RaftLog` never calls `RaftNode`.
+- [x] **F1 + F1b** `6912774` — the RPC term decision was split across separate
+      lock acquisitions from the mutation it authorized, so a stale-term request
+      could splice entries in behind a concurrent term change. Both receivers now
+      decide and act under one lock. `termDecisionHook` makes the race
+      deterministic; pre-fix the test fails with *entry 1 has term 6 at
+      currentTerm 7*.
+- [x] **F1c** `38458d0` — *(not in the original review; found auditing lock
+      order)* the vote sampled log state before taking the lock, so the §5.4.1
+      comparison could tear or go stale. `LastLogState` + callback under `rn.mu`.
 
-- [x] **F6 — apply failures must be fatal.** *(done `08836b4`)* — entry read and
-      decoded before `lastApplied` advances; all three failure conditions halt via
-      a `fatalf` seam. 4 tests. **Required F5 and F17 to land first** — both are
-      generators of the missing-entry condition this now halts on. `applyCommitted`
-      ([engine.go:271](../internal/engine/engine.go#L271)) calls
-      `AdvanceLastApplied()` unconditionally, then `continue`s past a missing
-      entry, a corrupt command, or a state-machine error. Every one of those
-      means this replica skipped an entry its peers applied — State Machine
-      Safety (§5.4.3) gone, silently.
-      *Fix:* none of the three is recoverable at runtime. Read the entry and
-      decode it *before* advancing `lastApplied`; on any error, log fatally and
-      halt. A crash is recoverable; divergence is not.
-      *Test:* `TestApplyCommitted_HaltsOnMissingEntry` (needs the halt action
-      injected, not a raw `log.Fatalf`, so the test can observe it).
-      *Blast radius:* apply loop. Introduces a `fatal func(...)` seam on Engine.
+### Phase 2 — Snapshot and compaction ✅
+F5 and F17 were pulled forward into Phase 0, ahead of F6: F6 makes a missing
+committed entry fatal, and both of those bugs *generate* missing committed
+entries. Landing F6 first would have turned two silent corruptions into two
+crashes. Only **F4** remains — see Phase 5 below, where it now sits.
 
----
+### Phase 3 — Verification harness ✅
+- [x] **Transport seam** `f223e13` — `raft.Transport` behind `Replicator`, no
+      behavior change.
+- [x] **Engine RPC facade** `01ccfbe` — `main.go`'s `rpcBinding` deleted, so the
+      harness exercises the real wiring rather than a copy free to drift.
+- [x] **F18** `f11cb7d` — `internal/testcluster`: real nodes over a fake network
+      with directed cuts on both legs, seeded drops, delay, and
+      `SetBlackholeDelay`. `CheckSingleLeaderPerTerm` sampled in every poll.
+      6.8s vs 48s for the process suite.
+- [x] **F18b** `b4e1033` — CI on ubuntu, `-race` throughout (cgo is unavailable
+      on the Windows box, so this is the only place races are detected). Harness
+      repeated `-count=3`. Also **M6**, untracking the committed WAL/meta.
 
-## Phase 1 — Atomic term handling
-
-The RPC receivers currently make their Figure 2 decisions across several
-independent lock acquisitions. This phase makes each receiver decide once.
-
-- [x] **F1 — `HandleAppendEntries` term TOCTOU.** *(done `6912774`, includes F1b)*
-      — both receivers hold `rn.mu` across the log work; `*Locked` variants added
-      for `BecomeFollower`/`SetFollowerCommitIndex`/`SeedFromSnapshot`;
-      `termDecisionHook` makes the race deterministic. **Note:** a follower now
-      holds `rn.mu` across the WAL fsync — M5 (batch fsyncs) is the relief valve.
-- [x] **F1c — vote decision sampled log state outside its critical section.**
-      *(done `38458d0`)* — found while auditing lock-order call sites, not in the
-      original review. `RaftLog.LastLogState` returns index+term under one
-      acquisition (they could tear); `HandleRequestVote` takes the reader as a
-      callback and invokes it under `rn.mu`, so a concurrent append can't make the
-      §5.4.1 comparison stale between sample and decision. 2 tests.
-      ([node.go:242](../internal/raft/node.go#L242)) Reads `currentTerm`, releases,
-      reads `State()`, releases, calls `BecomeFollower`, releases, then splices
-      the log with no node lock held. Two concurrent HTTP goroutines carrying
-      terms 6 and 7 both pass step 1 against a stale `currentTerm = 5`; the
-      term-7 one wins the `BecomeFollower` race and the term-6 one still splices
-      its entries in and replies `Success`. Direct Log Matching violation.
-      *Fix:* one critical section decides `reject` / `accept-at-term-T` and
-      publishes T; after the splice, re-verify `CurrentTerm == T` under the lock
-      before returning `Success`, else return failure without acking.
-      *Test:* `TestHandleAppendEntries_ConcurrentTermsRejectStale` (two
-      goroutines, `-race`, assert the lower-term append is not applied).
-      *Blast radius:* the hottest path in the system. Do not combine with F17.
-
-- [x] **F1b — `HandleInstallSnapshot` has the identical structure.** *(done
-      `6912774`, folded into F1 — the two receivers share the `*Locked` helpers,
-      so splitting them across commits would have left the tree uncompilable.)*
-
-- [x] **F11 — lock discipline is documented as a lie.** *(done `d2081b0`)* —
-      header now states the order `rn.mu → rl.mu` and records that it is safe by
-      construction (`RaftLog` holds no reference to `RaftNode`; verified by grep).
-      Doc-only, landed before F1 as planned. The node.go header says
-      `RaftNode.mu` and `RaftLog.mu` are "NEVER held simultaneously";
-      `AdvanceCommitIndex` ([node.go:217](../internal/raft/node.go#L217)) calls
-      `termAt(quorumIndex)` — which takes `rl.mu` — while holding `rn.mu`. No
-      deadlock today because nothing goes `rl.mu → rn.mu`, but the invariant is
-      false and the next `RaftLog` method that consults the node deadlocks.
-      *Fix:* adopt an explicit **order**: `rn.mu` may be taken before `rl.mu`,
-      never the reverse. Rewrite the header comment and the `AdvanceCommitIndex`
-      doc comment to state the order. Audit every call site for violations.
-      Note F1 will likely add more `rn.mu`-held-across-log-call paths, so land
-      this decision first.
-      *Test:* none directly; enforced by review + `go vet`/`-race` in CI.
-      *Blast radius:* documentation plus an audit. No behavior change.
+### Phase 4 — Leadership has one owner ✅
+- [x] **F7, F8, F15, F9** `f0f47e1` — landed as one commit because they are four
+      symptoms of one cause: leadership had two owners, the control loop and any
+      HTTP goroutine handling an inbound higher-term RPC. The fixes interlock —
+      `reconcileLeadership` (F7) is what makes F8's guard safe to simplify, and
+      F15's term check is meaningless without F7 noticing the stepdown. F9 was
+      A/B verified: with the blocking `wg.Wait()` restored and two of five peers
+      black-holed, the cluster fails to elect at all within 10s; with the fix it
+      elects in ~407ms.
 
 ---
 
-## Phase 2 — Snapshot and compaction correctness
+## Open work
 
-> **Execution note (2026-07-21):** F5 and F17 were pulled forward into Phase 0,
-> ahead of F6. F6 makes a missing committed entry a halt condition, and both of
-> these bugs *generate* missing committed entries — F5 by compacting past
-> `lastApplied`, F17 by shrinking the log before raising the apply boundary.
-> Landing F6 first would have converted two rare silent corruptions into two rare
-> crashes. Only F4 remains in this phase.
-
-- [x] **F17 — `HandleInstallSnapshot` resets the log before persisting the
-      snapshot.** *(done `ebabf61`)* — order is now restore → persist →
-      SeedFromSnapshot → ResetToSnapshot; `RestoreOffset` reconciles the
-      snapshot/WAL overlap that persist-first legitimizes. 5 tests. ([node.go:349](../internal/raft/node.go#L349)) Order is
-      `restore` → `ResetToSnapshot` (rewrites/discards the WAL) → `persist`. A
-      crash in that window leaves a follower that has discarded fsync-acked
-      committed entries with no snapshot covering them. The code comment argues
-      for this order; the argument is backwards — a persisted snapshot covering
-      entries still present in the log is harmless, the reverse is unrecoverable.
-      *Fix:* `restore` → `persist` → `SeedFromSnapshot` → `ResetToSnapshot`.
-      *Test:* `TestHandleInstallSnapshot_PersistBeforeLogReset` (record call
-      order), plus a failure-path test asserting the log is untouched when
-      persist fails.
+- [ ] **F19 — a leader that loses its quorum never steps down.** *(found
+      2026-07-21 while writing the F18 minority test; not in the original review)*
+      Quorum counting is correct — no minority node ever wins an election — but
+      the incumbent keeps `Role == Leader` indefinitely after being cut off. Not a
+      Figure 2 violation (a stale leader cannot commit), but two things downstream
+      assume a node claiming leadership can reach a quorum: `/get` serves local
+      state (**F12**) so a deposed leader answers with arbitrarily stale data, and
+      clients are redirected to it (**F10**) only to hang until the deadline.
+      *Fix:* CheckQuorum — track per-peer ack recency, step down when a majority
+      has not been heard from within an election timeout. **This is the same
+      machinery ReadIndex needs, so build it once in F12 and let F19 fall out.**
+      *Test:* `TestPartitionedLeaderStepsDown`, currently `t.Skip`ped in
+      `internal/testcluster/cluster_test.go` with the reason inline.
 
 - [ ] **F4 — `InstallSnapshotResponse` has no success flag.**
       ([types.go:89](../internal/raft/types.go#L89)) Every failure path in the
-      receiver returns the byte-identical `{Term}`, so the leader can't
-      distinguish "restored" from "restore failed" and unconditionally runs
-      `UpdatePeerProgress(peerID, req.LastIncludedIndex)`
-      ([replicator.go:196](../internal/raft/replicator.go#L196)). A phantom
-      quorum then commits entries held by one server → Leader Completeness gone.
-      *Fix:* add `Success bool`; leader advances progress only on `Success`.
-      Figure 13 omits it only because the paper's receiver has no failure modes
-      short of a stale term; ours does.
+      receiver returns the byte-identical `{Term}`, so the leader cannot tell
+      "restored" from "restore failed" and unconditionally runs
+      `UpdatePeerProgress(peerID, req.LastIncludedIndex)`. A phantom quorum then
+      commits entries held by one server — Leader Completeness gone. Figure 13
+      omits the flag only because the paper's receiver has no failure modes short
+      of a stale term; ours does.
+      *Fix:* add `Success bool`; advance progress only on it.
       *Test:* `TestInstallSnapshotTo_NoProgressOnFailure`.
-
-- [x] **F5 — compaction snapshots at `commitIndex`, not `lastApplied`.**
-      *(done `e23918b`)* — compacts to `lastApplied`; refuses to compact when
-      `TermAt` cannot resolve the index; `NeedsCompaction` param renamed. 3 tests.
-      ([engine.go:299](../internal/engine/engine.go#L299)) The state machine
-      reflects `lastApplied`; §7 defines last-included-index as "the last entry
-      the state machine had applied". On a follower these diverge routinely
-      because `SetFollowerCommitIndex` runs on the HTTP goroutine and can jump
-      `commitIndex` between `applyCommitted()` and `maybeCompact()` in one tick.
-      Result: a snapshot claiming entries whose effects it does not contain, and
-      then `TruncateBeforeIndex` deletes the entries that would have fixed it.
-      *Fix:* compact at `lastApplied`. Also guard the companion bug — `term :=
-      TermAt(commitIndex)` returns `0` for an already-compacted index, and the
-      snapshot file gets written with `LastIncludedTerm: 0` before
-      `TruncateBeforeIndex` bails, poisoning the post-snapshot consistency check
-      across a restart. Refuse to compact when `TermAt` returns 0.
-      *Test:* `TestCompactUsesLastApplied`, `TestCompactRefusesUnknownTerm`.
-
----
-
-## Phase 3 — Verification harness
-
-Everything after this point is concurrency and partition behavior. Unit tests
-cannot demonstrate the bugs, so the harness comes before the restructure it is
-meant to validate. Build it fresh; do not lift it from the stash.
-
-- [x] **F18 — in-process cluster harness.** *(done `f11cb7d`; `Transport` seam
-      `f223e13`, engine RPC facade `01ccfbe`)* — `internal/testcluster` with
-      directed cuts on both legs, seeded drops, delays; 6 tests in 6.8s vs 48s for
-      the process suite; `CheckSingleLeaderPerTerm` sampled in every poll. Surfaced
-      **F19** (below).
-- [x] **F18b — CI.** *(done `b4e1033`)* — ubuntu, `-race` on everything, harness
-      repeated `-count=3`. Also untracked the committed WAL/meta (M6). New `internal/testcluster`:
-      real `Engine`/`RaftNode`/`RaftLog` instances wired over an injectable
-      transport with directed link cuts (request *and* response legs), seeded
-      drops, and delays. Helpers: `SetViaLeader`, `WaitConverged`,
-      `WaitLeaderAmong`, `Isolate`, `Heal`. Every poll iteration asserts
-      `CheckSingleLeaderPerTerm` — the harness should fail on Election Safety
-      violations regardless of what the individual test is looking at.
-      *Prerequisite:* extract a `raft.Transport` interface so `Replicator` is no
-      longer hardwired to `http.Client`
-      ([replicator.go:97](../internal/raft/replicator.go#L97)). That refactor is
-      its own commit, landed first, with no behavior change.
-      *Test:* `TestHarness_ElectsSingleLeader`, `TestHarness_PartitionHealsData`.
-
-- [ ] **F19 — a leader that loses its quorum never steps down.** *(found
-      2026-07-21 while writing the F18 minority test; not in the original review
-      as a separate item)* Quorum counting is correct — no minority node ever wins
-      an election — but the incumbent keeps `Role == Leader` indefinitely after
-      being cut off. Not a Figure 2 violation (a stale leader cannot commit), but
-      two things downstream assume a node claiming leadership can reach a quorum:
-      `/get` serves local state (**F12**) so a deposed leader answers with
-      arbitrarily stale data, and clients are redirected to it (**F10**) only to
-      hang until the proposal deadline.
-      *Fix:* CheckQuorum — the leader tracks per-peer ack recency and steps down
-      when a majority has not been heard from within an election timeout. This is
-      the same machinery ReadIndex needs in F12, so **build it once, in F12, and
-      have F19 fall out of it.**
-      *Test:* `TestPartitionedLeaderStepsDown`, currently `t.Skip`ped in
-      `internal/testcluster/cluster_test.go` with the reason inline — unskip it
-      when the mechanism lands.
-
----
-
-## Phase 4 — Leadership has one owner ✅
-
-> **Landed as one commit (`f0f47e1`).** These are four symptoms of a single
-> cause — leadership had two owners, the control loop and any HTTP goroutine
-> handling an inbound higher-term RPC — and the fixes interlock: F7's
-> `reconcileLeadership` is what makes F8's guard safe to simplify, and F15's
-> term check is meaningless without F7 noticing the stepdown. Splitting them
-> would have shipped three intermediate states that were each incoherent.
->
-> The F9 test required extending the fake network with `SetBlackholeDelay`: a
-> cut link that fails immediately models a refused connection, which costs the
-> caller nothing and therefore cannot distinguish waiting-for-a-quorum from
-> waiting-for-everyone.
-
-Currently two: the control loop, and any HTTP goroutine that calls
-`BecomeFollower`. These four findings are one bug wearing four hats.
-
-- [x] **F7 — inbound-RPC stepdown never reconciles the engine.** *(done `f0f47e1`)*
-      `HandleRequestVote`/`HandleAppendEntries` demote a leader on the HTTP
-      goroutine; `stopReplicators()` is only reachable via `handleStepDown`
-      (outbound path) or shutdown. Stale replicators survive with the old
-      `pr.term`, and `startReplicators` no-ops on re-election because of the
-      `len(e.replicators) > 0` guard
-      ([engine.go:418](../internal/engine/engine.go#L418)). They then resume
-      under a new term while reporting against the old one.
-      *Fix:* `reconcileLeadership()` as the first thing on every tick — detect
-      leader→follower transitions, tear down replicators, fail waiters, and
-      self-heal missing replicators. Track `replicatorsTerm` and replace stale
-      sets rather than short-circuiting on non-empty.
-      *Test:* `TestReconcileInboundStepdown`,
-      `TestStartReplicatorsReplacesStaleTerm`.
-
-- [ ] **F8 — `handleStepDown` guard is inverted for leaders.**
-      ([engine.go:259](../internal/engine/engine.go#L259))
-      `higherTerm <= CurrentTerm() && !IsLeader()` lets a *stale* signal whose
-      term is ≤ our own depose a healthy leader. With F7 this is a self-sustaining
-      oscillation: re-elected at term 7, stale replicator reports 7, node deposes
-      itself immediately.
-      *Fix:* `if higherTerm <= e.node.CurrentTerm() { return }`.
-      *Test:* `TestHandleStepDown_IgnoresStaleTerm`.
-
-- [x] **F15 — waiters are not term-scoped.** *(done `f0f47e1`)*
-      ([engine.go:188](../internal/engine/engine.go#L188)) `fireCommittedWaiters`
-      resolves on `w.index <= commitIndex` alone. A waiter that survives an
-      unnoticed stepdown (F7) and a re-election inside its 2s deadline gets acked
-      `nil` when its index now holds a *different* leader's entry — the client is
-      told its write committed when it never did.
-      *Fix:* record `term` on `waiter`; ack only on term match, else
-      `ErrNotLeader`.
-      *Test:* `TestFireCommittedWaiters_TermMismatchFails`.
-
-- [ ] **F9 — `runElection` blocks the control loop and waits for all peers.**
-      ([engine.go:337](../internal/engine/engine.go#L337)) Called synchronously
-      from `onTick`, ends in `wg.Wait()`, each RPC has a 1s timeout. The control
-      loop stalls up to a full second — no proposals, applies, or `stepDownCh`
-      drains — and §5.2 says a candidate wins "if it receives votes from a
-      majority", i.e. the moment the majority arrives, not when the slowest peer
-      answers. With a 300–600ms election timeout and a 1s RPC timeout, one
-      black-holed peer makes every election overrun its own timeout.
-      *Fix:* fire the RPCs and return; deliver results on a `voteCh` handled by
-      the control loop; promote the instant a majority is tallied. Single-node
-      clusters must win immediately.
-      *Test:* `TestRunElectionDoesNotBlockOnSlowPeer`, harness test with one
-      peer black-holed asserting sub-timeout election.
-
----
 
 ## Phase 5 — Client-facing protocol (§8)
 
@@ -403,17 +223,26 @@ Batchable; each still gets its own commit.
 - [ ] **M5** — `writeEntryToDisk` ([log.go:498](../internal/raft/log.go#L498))
       fsyncs per entry, so a 100-entry batch does 100 fsyncs. Batch the writes
       and sync once, as `rewriteWALLocked` already does.
-- [ ] **M6** — `cmd/crystal/data/raft.wal` and `raft.meta` are tracked in git
-      despite `.gitignore` covering the patterns. `git rm --cached`.
+- [x] **M6** — done in `b4e1033`. `cmd/crystal/data/raft.wal` and `raft.meta`
+      were tracked despite `.gitignore` covering the patterns; ignore rules do not
+      apply to files already in the index.
 
 ---
 
 ## Sequencing rationale
 
-Phases 0–2 are local, unit-testable, and each closes a path to silent data loss;
-they land first because they are cheap and independent. Phase 3 exists because
-Phases 4–6 cannot be honestly verified without partition testing. Phase 4 is the
-one structural change: it gives leadership a single owner, which makes F7, F8,
-F15 and F9 collapse into one coherent design instead of four patches. Phase 5
-changes the client contract and so waits for a stable core. Phase 6's membership
-work is deliberately last and may be re-scoped.
+Phases 0–2 were local, unit-testable, and each closed a path to silent data loss,
+so they landed first. Phase 3 existed because Phases 4–6 cannot be honestly
+verified without partition testing — a judgement the F9 A/B check vindicated: the
+old blocking election was not merely slow, it prevented election entirely against
+black-holed peers, and no unit test would have shown that. Phase 4 was the one
+structural change, giving leadership a single owner so F7, F8, F15 and F9
+collapsed into one design instead of four patches.
+
+**What remains, and why in this order.** F10 is a one-line correctness fix and
+should land first. F4 is small and closes a Leader Completeness hole. F12 is the
+largest remaining item and should absorb F19, since CheckQuorum and ReadIndex
+need the same per-peer ack machinery — building it twice would be the mistake.
+F13 is cheap once the harness is trusted. F14 changes the wire format and the
+StateMachine interface, so it wants a stable core beneath it. F16 (joint
+consensus) stays last and may be re-scoped.
