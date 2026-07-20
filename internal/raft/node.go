@@ -109,6 +109,19 @@ func NewRaftNode(nodeID int, peerIDs []int, clusterSize int, metadataPath string
 	return rn, nil
 }
 
+// termDecisionHook, when non-nil, is invoked by the RPC receivers at the instant
+// they have formed their view of currentTerm and are about to act on it. It is
+// always nil in production.
+//
+// It exists because the atomicity of that decision cannot be tested any other
+// way. The window between reading the term and using it is microseconds wide, so
+// racing goroutines at it proves nothing when they pass — the test has to be able
+// to stall one request there and run another to completion. Everything the hook
+// guards is inside the receiver's critical section, so an implementation that has
+// correctly made the decision atomic will hold rn.mu while the hook runs; that is
+// the property the tests rely on.
+var termDecisionHook func(reqTerm int)
+
 // ---- Public read accessors (safe for concurrent callers) ----
 
 func (rn *RaftNode) IsLeader() bool {
@@ -253,12 +266,27 @@ func (rn *RaftNode) AdvanceCommitIndex(localLatestIndex int, termAt func(index i
 //  3. Run the log-matching check + splice (steps 2–4) via RaftLog.AppendEntriesToLog.
 //  4. On success, advance commitIndex = min(leaderCommit, last new index) (step 5).
 //
-// It takes the RaftLog explicitly rather than holding a reference, preserving the
-// rule that RaftNode.mu and RaftLog.mu are never held simultaneously: this method
-// touches rn.mu only for term/role/commit, and delegates all log mutation to the
-// log's own lock.
+// It takes the RaftLog explicitly rather than holding a reference so that
+// RaftNode keeps no dependency on the log type. The whole receiver runs under
+// rn.mu, and the log calls happen inside it — the lock order is rn.mu → rl.mu
+// (see the file header).
+//
+// Holding the lock across the log work is the point, not an accident. The term
+// check in step 1 authorizes everything that follows it; if the check and the
+// mutation are separate critical sections, two concurrent requests can both read
+// the same currentTerm, the newer one can raise the term, and the older one —
+// already past its check — still splices its entries in and reports Success. That
+// is a Log Matching violation produced entirely by lock granularity, and it is
+// reachable whenever a leader change overlaps in-flight replication.
 func (rn *RaftNode) HandleAppendEntries(rl *RaftLog, req AppendEntriesRequest) AppendEntriesResponse {
-	currentTerm := rn.CurrentTerm()
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if termDecisionHook != nil {
+		termDecisionHook(req.Term)
+	}
+
+	currentTerm := rn.persistent.CurrentTerm
 
 	// Step 1: reject a stale leader outright.
 	if req.Term < currentTerm {
@@ -267,25 +295,22 @@ func (rn *RaftNode) HandleAppendEntries(rl *RaftLog, req AppendEntriesRequest) A
 
 	// Step 2: the leader's term is current or newer. Accept its authority and,
 	// if the term advanced (or we thought we were leader/candidate), step down.
-	// BecomeFollower persists term+votedFor before we act on the entries, which
-	// is required before responding to the RPC (Figure 2, stable-storage rule).
-	role, _ := rn.State()
-	if req.Term > currentTerm || role != Follower {
-		if err := rn.BecomeFollower(req.Term, req.LeaderID); err != nil {
+	// The term must be persisted before we act on the entries (Figure 2,
+	// stable-storage rule); on failure we neither adopt it nor touch the log.
+	if req.Term > currentTerm || rn.Role != Follower {
+		if err := rn.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
 			log.Printf("[RAFT] BecomeFollower during AppendEntries failed: %v", err)
 			return AppendEntriesResponse{Term: currentTerm, Success: false}
 		}
-		currentTerm = req.Term
+		currentTerm = rn.persistent.CurrentTerm
 	} else {
 		// Same term, already a follower: just refresh the known leader.
-		rn.mu.Lock()
 		rn.LeaderID = req.LeaderID
-		rn.mu.Unlock()
 	}
 
 	// A valid AppendEntries from the current leader resets the election timer:
 	// this is how a live leader's heartbeats suppress spurious elections (§5.2).
-	rn.noteContact()
+	rn.lastContact = time.Now()
 
 	// Steps 2–4: consistency check and splice, owned by the log.
 	matchIndex, conflictTerm, conflictIndex, ok := rl.AppendEntriesToLog(
@@ -300,7 +325,7 @@ func (rn *RaftNode) HandleAppendEntries(rl *RaftLog, req AppendEntriesRequest) A
 	}
 
 	// Step 5: advance our commit index toward the leader's.
-	rn.SetFollowerCommitIndex(req.LeaderCommit, matchIndex)
+	rn.setFollowerCommitIndexLocked(req.LeaderCommit, matchIndex)
 
 	return AppendEntriesResponse{
 		Term:       currentTerm,
@@ -329,7 +354,19 @@ func (rn *RaftNode) HandleInstallSnapshot(
 	restore func(data []byte) error,
 	persist func() error,
 ) InstallSnapshotResponse {
-	currentTerm := rn.CurrentTerm()
+	// As in HandleAppendEntries, the term decision and everything it authorizes
+	// are one critical section. This receiver destroys log state and resets the
+	// state machine on the strength of that decision, so a request that lost the
+	// term race must not be able to act on a check it passed before the race was
+	// settled. Lock order is rn.mu → rl.mu (see the file header).
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if termDecisionHook != nil {
+		termDecisionHook(req.Term)
+	}
+
+	currentTerm := rn.persistent.CurrentTerm
 
 	// Step 1: reject a stale leader.
 	if req.Term < currentTerm {
@@ -337,23 +374,21 @@ func (rn *RaftNode) HandleInstallSnapshot(
 	}
 
 	// Accept the leader's authority; step down if the term advanced or we were
-	// not already a follower. Persist-before-respond is honored by BecomeFollower.
-	role, _ := rn.State()
-	if req.Term > currentTerm || role != Follower {
-		if err := rn.BecomeFollower(req.Term, req.LeaderID); err != nil {
+	// not already a follower. Persist-before-respond is honored by
+	// becomeFollowerLocked.
+	if req.Term > currentTerm || rn.Role != Follower {
+		if err := rn.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
 			log.Printf("[RAFT] BecomeFollower during InstallSnapshot failed: %v", err)
 			return InstallSnapshotResponse{Term: currentTerm}
 		}
-		currentTerm = req.Term
+		currentTerm = rn.persistent.CurrentTerm
 	} else {
-		rn.mu.Lock()
 		rn.LeaderID = req.LeaderID
-		rn.mu.Unlock()
 	}
-	rn.noteContact() // a valid snapshot is a sign of life; reset election timer
+	rn.lastContact = time.Now() // a valid snapshot is a sign of life
 
 	// If we already cover this snapshot's index, it's stale — ack and move on.
-	if req.LastIncludedIndex <= rn.snapshotFloor(rl) {
+	if req.LastIncludedIndex <= rl.FirstIndex()-1 {
 		return InstallSnapshotResponse{Term: currentTerm}
 	}
 
@@ -380,7 +415,7 @@ func (rn *RaftNode) HandleInstallSnapshot(
 	// apply loop runs on another goroutine and halts on a committed entry it
 	// cannot read (see Engine.applyCommitted); shrinking the log first would
 	// expose exactly that state for as long as the two calls are apart.
-	rn.SeedFromSnapshot(req.LastIncludedIndex)
+	rn.seedFromSnapshotLocked(req.LastIncludedIndex)
 
 	// Steps 6–7: reconcile the log against the snapshot boundary.
 	if err := rl.ResetToSnapshot(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
@@ -541,7 +576,14 @@ func candidateUpToDate(candTerm, candIndex, voterTerm, voterIndex int) bool {
 func (rn *RaftNode) SetFollowerCommitIndex(leaderCommit, latestLogIndex int) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
+	rn.setFollowerCommitIndexLocked(leaderCommit, latestLogIndex)
+}
 
+// setFollowerCommitIndexLocked is the body of SetFollowerCommitIndex for callers
+// already holding rn.mu.
+//
+// Caller must hold rn.mu (write).
+func (rn *RaftNode) setFollowerCommitIndexLocked(leaderCommit, latestLogIndex int) {
 	// Raft §5.3: commitIndex = min(leaderCommit, index of last new entry)
 	newCommit := leaderCommit
 	if latestLogIndex < newCommit {
@@ -580,6 +622,14 @@ func (rn *RaftNode) CommitAndApplyBoundary() (commitIndex, lastApplied int) {
 func (rn *RaftNode) SeedFromSnapshot(lastIncludedIndex int) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
+	rn.seedFromSnapshotLocked(lastIncludedIndex)
+}
+
+// seedFromSnapshotLocked is the body of SeedFromSnapshot for callers already
+// holding rn.mu.
+//
+// Caller must hold rn.mu (write).
+func (rn *RaftNode) seedFromSnapshotLocked(lastIncludedIndex int) {
 	if lastIncludedIndex > rn.CommitIndex {
 		rn.CommitIndex = lastIncludedIndex
 	}
@@ -599,7 +649,15 @@ func (rn *RaftNode) SeedFromSnapshot(lastIncludedIndex int) {
 func (rn *RaftNode) BecomeFollower(term, leaderID int) error {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
+	return rn.becomeFollowerLocked(term, leaderID)
+}
 
+// becomeFollowerLocked is BecomeFollower's body, for callers that already hold
+// rn.mu — the RPC receivers, which must not drop the lock between deciding on a
+// term and acting on it.
+//
+// Caller must hold rn.mu (write).
+func (rn *RaftNode) becomeFollowerLocked(term, leaderID int) error {
 	next := rn.persistent
 	if term > next.CurrentTerm {
 		next.CurrentTerm = term
