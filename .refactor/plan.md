@@ -28,7 +28,9 @@ used. Every fix here is re-derived from scratch on clean `3ce740d`. Do not
 No structural change. Highest safety-per-line-changed in the tree. These three
 are what stand between a power cut and a silently divergent cluster.
 
-- [ ] **F2 — fsync persistent state.** `savePersistentStateLocked`
+- [x] **F2 — fsync persistent state.** *(done `d8434f1`)* — new `internal/fsutil`
+      (`WriteFileAtomic`, `SyncDir` + Windows no-op behind build tags), applied to
+      raft metadata, snapshot writes, and the WAL rewrite rename. 6 new tests. `savePersistentStateLocked`
       ([node.go:629](../internal/raft/node.go#L629)) does `os.WriteFile` + `Rename`
       with no `Sync` on the temp file and no fsync of the containing directory.
       Figure 2's "updated on stable storage before responding to RPCs" is not
@@ -43,7 +45,10 @@ are what stand between a power cut and a silently divergent cluster.
       the call order; assert Sync precedes Rename).
       *Blast radius:* every term change and vote. Low risk, pure addition.
 
-- [ ] **F3 — persist before mutate.** `BecomeCandidate`
+- [x] **F3 — persist before mutate.** *(done `71ccf2a`)* — `stateStore` seam +
+      `commitPersistentLocked` (Save first, adopt on success); applied to
+      `BecomeCandidate`, `HandleRequestVote`, `BecomeFollower`. No-op changes skip
+      the write so a same-term stepdown can't be blocked by a broken disk. 4 tests. `BecomeCandidate`
       ([node.go:405](../internal/raft/node.go#L405)) increments the term, votes for
       itself, and flips to Candidate *before* calling
       `savePersistentStateLocked`, with no rollback on failure. On persist error
@@ -59,7 +64,10 @@ are what stand between a power cut and a silently divergent cluster.
       *Blast radius:* election path. Needs a persist seam on `RaftNode` to
       inject failure — introduce a small `stateStore` interface.
 
-- [ ] **F6 — apply failures must be fatal.** `applyCommitted`
+- [x] **F6 — apply failures must be fatal.** *(done `08836b4`)* — entry read and
+      decoded before `lastApplied` advances; all three failure conditions halt via
+      a `fatalf` seam. 4 tests. **Required F5 and F17 to land first** — both are
+      generators of the missing-entry condition this now halts on. `applyCommitted`
       ([engine.go:271](../internal/engine/engine.go#L271)) calls
       `AdvanceLastApplied()` unconditionally, then `continue`s past a missing
       entry, a corrupt command, or a state-machine error. Every one of those
@@ -115,8 +123,17 @@ independent lock acquisitions. This phase makes each receiver decide once.
 
 ## Phase 2 — Snapshot and compaction correctness
 
-- [ ] **F17 — `HandleInstallSnapshot` resets the log before persisting the
-      snapshot.** ([node.go:349](../internal/raft/node.go#L349)) Order is
+> **Execution note (2026-07-21):** F5 and F17 were pulled forward into Phase 0,
+> ahead of F6. F6 makes a missing committed entry a halt condition, and both of
+> these bugs *generate* missing committed entries — F5 by compacting past
+> `lastApplied`, F17 by shrinking the log before raising the apply boundary.
+> Landing F6 first would have converted two rare silent corruptions into two rare
+> crashes. Only F4 remains in this phase.
+
+- [x] **F17 — `HandleInstallSnapshot` resets the log before persisting the
+      snapshot.** *(done `ebabf61`)* — order is now restore → persist →
+      SeedFromSnapshot → ResetToSnapshot; `RestoreOffset` reconciles the
+      snapshot/WAL overlap that persist-first legitimizes. 5 tests. ([node.go:349](../internal/raft/node.go#L349)) Order is
       `restore` → `ResetToSnapshot` (rewrites/discards the WAL) → `persist`. A
       crash in that window leaves a follower that has discarded fsync-acked
       committed entries with no snapshot covering them. The code comment argues
@@ -139,7 +156,9 @@ independent lock acquisitions. This phase makes each receiver decide once.
       short of a stale term; ours does.
       *Test:* `TestInstallSnapshotTo_NoProgressOnFailure`.
 
-- [ ] **F5 — compaction snapshots at `commitIndex`, not `lastApplied`.**
+- [x] **F5 — compaction snapshots at `commitIndex`, not `lastApplied`.**
+      *(done `e23918b`)* — compacts to `lastApplied`; refuses to compact when
+      `TermAt` cannot resolve the index; `NeedsCompaction` param renamed. 3 tests.
       ([engine.go:299](../internal/engine/engine.go#L299)) The state machine
       reflects `lastApplied`; §7 defines last-included-index as "the last entry
       the state machine had applied". On a follower these diverge routinely
