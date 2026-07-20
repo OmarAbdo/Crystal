@@ -66,11 +66,9 @@ func main() {
 	go eng.Run(done)
 
 	// ---- Build and start the HTTP server ----
-	// rpcBinding adapts the RaftNode's RPC receivers (which need the log) to the
-	// transport layer's single-argument interface, so the HTTP layer never has
-	// to know about the RaftLog.
-	rpc := &rpcBinding{node: node, log: raftLog, sm: stateMachine, snapshots: snapshots}
-	srv := transport.NewServer(node, eng.ProposalQueue(), stateMachine, rpc)
+	// The engine is the inbound RPC facade: it already owns the node, log, state
+	// machine and snapshot store, so the HTTP layer never has to know about them.
+	srv := transport.NewServer(node, eng.ProposalQueue(), stateMachine, eng)
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -80,43 +78,6 @@ func main() {
 	if err := http.ListenAndServe(cfg.Port, mux); err != nil {
 		log.Fatalf("HTTP server error: %v", err)
 	}
-}
-
-// rpcBinding binds a RaftNode to its RaftLog (and, for snapshots, the state
-// machine and snapshot store) so the RPC receivers can be exposed through the
-// transport layer's single-argument interfaces.
-type rpcBinding struct {
-	node      *raft.RaftNode
-	log       *raft.RaftLog
-	sm        store.StateMachine
-	snapshots *store.SnapshotManager
-}
-
-func (b *rpcBinding) HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse {
-	return b.node.HandleAppendEntries(b.log, req)
-}
-
-func (b *rpcBinding) HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse {
-	// restore resets the state machine from the snapshot bytes (Fig 13 step 8).
-	restore := func(data []byte) error {
-		return b.sm.Restore(data)
-	}
-	// persist durably writes the received snapshot to this node's snapshot file
-	// (step 5), using the same meta so a later restart re-establishes the offset.
-	persist := func() error {
-		return b.snapshots.Write(store.SnapshotMeta{
-			LastIncludedIndex: req.LastIncludedIndex,
-			LastIncludedTerm:  req.LastIncludedTerm,
-		}, b.sm)
-	}
-	return b.node.HandleInstallSnapshot(b.log, req, restore, persist)
-}
-
-func (b *rpcBinding) HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse {
-	// Pass the log-state reader itself, not a pre-read snapshot: HandleRequestVote
-	// samples it inside its critical section so the §5.4.1 up-to-date check cannot
-	// be decided against a log that has since moved on.
-	return b.node.HandleRequestVote(req, b.log.LastLogState)
 }
 
 // restoreFromSnapshot loads the latest snapshot (if any) into the state machine

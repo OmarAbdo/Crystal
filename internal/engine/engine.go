@@ -562,3 +562,40 @@ func (e *Engine) buildSnapshotRequest() (raft.InstallSnapshotRequest, bool) {
 		Data:              data,
 	}, true
 }
+
+// ---- Inbound RPC facade ----
+//
+// The engine is the single place that owns a node's Raft dependencies, so it is
+// also where inbound RPCs are bound to them. The transport layer sees only these
+// three methods and knows nothing of RaftNode, RaftLog, or the snapshot store.
+//
+// The receivers themselves live in the raft package; these methods only supply
+// the collaborators that package cannot import (store) or hold (the log).
+
+// HandleAppendEntries binds the AppendEntries receiver to this node's log.
+func (e *Engine) HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse {
+	return e.node.HandleAppendEntries(e.raftLog, req)
+}
+
+// HandleRequestVote binds the RequestVote receiver to this node's log. The log
+// state is passed as a reader, not a snapshot, so the §5.4.1 comparison is made
+// against the log as it stands inside the vote's critical section (F1c).
+func (e *Engine) HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse {
+	return e.node.HandleRequestVote(req, e.raftLog.LastLogState)
+}
+
+// HandleInstallSnapshot binds the InstallSnapshot receiver to this node's state
+// machine and snapshot store. The raft package takes these as callbacks because
+// it cannot import store (store imports raft).
+func (e *Engine) HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse {
+	restore := func(data []byte) error {
+		return e.stateMachine.Restore(data)
+	}
+	persist := func() error {
+		return e.snapshots.Write(store.SnapshotMeta{
+			LastIncludedIndex: req.LastIncludedIndex,
+			LastIncludedTerm:  req.LastIncludedTerm,
+		}, e.stateMachine)
+	}
+	return e.node.HandleInstallSnapshot(e.raftLog, req, restore, persist)
+}
