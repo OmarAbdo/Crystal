@@ -1,0 +1,191 @@
+package testcluster
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"crystal/internal/engine"
+)
+
+// §8: "Read-only operations can be handled without writing anything into the
+// log. However, with no additional measures, this would run the risk of
+// returning stale data, since the leader responding to the request might have
+// been superseded by a newer leader of which it is unaware."
+//
+// That sentence describes a specific, reachable scenario, and these tests build
+// it: partition the leader, let the majority elect a replacement and accept a
+// write, then ask the old leader — which still believes it leads — for the value.
+
+func TestLinearizableReadReturnsCommittedWrite(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v1", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	got, ok, err := c.Read(leader, "k", 3*time.Second)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !ok || got != "v1" {
+		t.Fatalf("read %q (found=%v), want v1", got, ok)
+	}
+}
+
+// The core linearizability property: a read issued after a write completes must
+// observe that write. Repeated, because a read-after-write race would show up
+// intermittently rather than reliably.
+func TestReadYourWrite(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	for i, v := range []string{"a", "b", "c", "d", "e"} {
+		if err := c.SetVia(leader, "k", v, 3*time.Second); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		got, ok, err := c.Read(leader, "k", 3*time.Second)
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if !ok || got != v {
+			t.Fatalf("read %d returned %q (found=%v), want %q — a read after a "+
+				"completed write did not observe it", i, got, ok, v)
+		}
+	}
+}
+
+// THE test this whole mechanism exists for. A partitioned leader still believes
+// it leads and its local state machine still holds the last value it knew. Asked
+// for a linearizable read, it must refuse rather than answer from that state.
+func TestPartitionedLeaderRefusesLinearizableRead(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "before", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "before", 5*time.Second)
+
+	// Cut the leader off. It keeps "before" in its local state machine.
+	c.Isolate(leader.ID)
+
+	// The majority elects a replacement and moves on without the old leader.
+	next := c.WaitLeaderAmong(c.Others(leader.ID), 5*time.Second)
+	if err := c.SetVia(next, "k", "after", 3*time.Second); err != nil {
+		t.Fatalf("Set on the new leader: %v", err)
+	}
+
+	// The stale node holds "before" locally...
+	if v, _ := c.Nodes[leader.ID].Store.Get("k"); v != "before" {
+		t.Fatalf("precondition: stale node holds %q, expected the old value", v)
+	}
+
+	// ...and must refuse to serve it as a linearizable read.
+	got, _, err := c.Read(c.Nodes[leader.ID], "k", 4*time.Second)
+	if err == nil {
+		t.Fatalf("partitioned node served a linearizable read (%q) instead of "+
+			"refusing — this is the §8 stale read", got)
+	}
+	if !errors.Is(err, engine.ErrReadTimeout) && !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("refused with %v, want ErrReadTimeout or ErrNotLeader", err)
+	}
+	t.Logf("partitioned node correctly refused: %v", err)
+}
+
+// The window CheckQuorum cannot cover, and therefore the one ReadIndex exists
+// for.
+//
+// CheckQuorum only reacts after a full grace period of silence, so for up to one
+// election timeout after a partition the old leader still believes — correctly,
+// as far as it can tell — that it leads. A read arriving inside that window is
+// admitted by a node that has already been superseded. ReadIndex is what holds
+// it: the read waits for a majority to confirm leadership, that confirmation
+// never comes, and the read is refused rather than answered from local state.
+//
+// Issuing the read immediately after the cut is what keeps this test inside the
+// window; waiting for the replacement election would let CheckQuorum resolve it
+// first and prove nothing about ReadIndex.
+func TestReadRefusedImmediatelyAfterPartition(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "before", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "before", 5*time.Second)
+
+	c.Isolate(leader.ID)
+
+	// No waiting: the node still believes it leads, and its state machine still
+	// holds a value it would happily return.
+	if leader.Raft.IsLeader() != true {
+		t.Skip("leader stepped down faster than the test could read; rerun")
+	}
+
+	got, _, err := c.Read(leader, "k", 4*time.Second)
+	if err == nil {
+		t.Fatalf("a leader partitioned moments ago served %q as a linearizable "+
+			"read; it cannot know whether that value is current", got)
+	}
+	if !errors.Is(err, engine.ErrReadTimeout) && !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("refused with %v, want ErrReadTimeout or ErrNotLeader", err)
+	}
+	t.Logf("refused inside the CheckQuorum window: %v", err)
+}
+
+// Reads must survive a leadership change: the client retries against whoever
+// leads next and gets the current value, not an error forever.
+func TestReadsResumeAfterFailover(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v1", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "v1", 5*time.Second)
+
+	c.Isolate(leader.ID)
+	next := c.WaitLeaderAmong(c.Others(leader.ID), 5*time.Second)
+
+	got, ok, err := c.Read(next, "k", 4*time.Second)
+	if err != nil {
+		t.Fatalf("read on the new leader: %v", err)
+	}
+	if !ok || got != "v1" {
+		t.Fatalf("read %q (found=%v), want v1", got, ok)
+	}
+}
+
+// A follower cannot establish that a read is current — only the leader can — so
+// it must refuse rather than answer from its own applied state.
+func TestFollowerRefusesLinearizableRead(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	follower := c.Nodes[c.Others(leader.ID)[0]]
+	if _, _, err := c.Read(follower, "anything", 2*time.Second); !errors.Is(err, engine.ErrNotLeader) {
+		t.Fatalf("follower read returned %v, want ErrNotLeader", err)
+	}
+}
+
+// Reads must keep working through packet loss — refusing on the first lost
+// heartbeat would make the mechanism useless in practice.
+func TestLinearizableReadsUnderPacketLoss(t *testing.T) {
+	c := New(t, Options{Size: 3, Seed: 7})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.SetDropRate(0.2)
+
+	got, ok, err := c.Read(leader, "k", 5*time.Second)
+	if err != nil {
+		t.Fatalf("read under 20%% loss: %v", err)
+	}
+	if !ok || got != "v" {
+		t.Fatalf("read %q (found=%v), want v", got, ok)
+	}
+}

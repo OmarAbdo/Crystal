@@ -130,8 +130,27 @@ func trySet(addr, key, value string) (int, error) {
 	return resp.StatusCode, nil
 }
 
+// tryGet reads a key with ?consistency=stale.
+//
+// These tests poll individual nodes to watch replication converge, which is
+// exactly what a stale read is for: they are asking "has this entry reached THIS
+// node yet", a question about one replica's local state. A linearizable read
+// answers a different question — "what is the cluster's current value" — and
+// followers correctly refuse it, so using the default here would test the read
+// contract rather than replication.
+//
+// tryGetLinearizable covers the default contract separately.
 func tryGet(addr, key string) (string, int, error) {
-	resp, err := http.Get("http://" + addr + "/get?key=" + key)
+	return doGet(addr, key, "stale")
+}
+
+// tryGetLinearizable uses the default read path: leader-only, quorum-confirmed.
+func tryGetLinearizable(addr, key string) (string, int, error) {
+	return doGet(addr, key, "linearizable")
+}
+
+func doGet(addr, key, consistency string) (string, int, error) {
+	resp, err := http.Get("http://" + addr + "/get?key=" + key + "&consistency=" + consistency)
 	if err != nil {
 		return "", 0, err
 	}
@@ -160,6 +179,30 @@ func findLeader(t *testing.T, nodes []*node, key, value string, timeout time.Dur
 	}
 	t.Fatalf("no leader accepted a write within %s", timeout)
 	return nil
+}
+
+// waitConverged blocks until every live node reports key=value on a stale read.
+func waitConverged(t *testing.T, nodes []*node, key, value string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		all := true
+		for _, nd := range nodes {
+			if nd.cmd == nil {
+				continue
+			}
+			body, code, err := tryGet(nd.addr(), key)
+			if err != nil || code != http.StatusOK || !bytes.Contains([]byte(body), []byte(value)) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("nodes did not converge on %s=%s within %s", key, value, timeout)
 }
 
 // ---- Tests ----
@@ -354,5 +397,61 @@ func TestFollowerCatchesUpViaSnapshot(t *testing.T) {
 	// on the follower — proving it came from the snapshot, not log shipping.
 	if body, _, _ := tryGet(victim.addr(), "k1"); !bytes.Contains([]byte(body), []byte("v1")) {
 		t.Fatalf("follower missing compacted-then-snapshotted key k1: %q", body)
+	}
+}
+
+// TestLinearizableReadContract exercises the default /get path over real HTTP:
+// the leader answers only after confirming leadership with a majority, and every
+// follower refuses with a redirect rather than serving its own local state.
+//
+// The harness proves the mechanism; this proves the wiring — that the read
+// actually travels transport -> engine -> quorum confirmation and back, and that
+// the refusal reaches the client as a usable HTTP response.
+func TestLinearizableReadContract(t *testing.T) {
+	bin := buildBinary(t)
+	nodes := startCluster(t, bin, 3)
+
+	leader := findLeader(t, nodes, "lin", "yes", 8*time.Second)
+	t.Logf("elected leader: node %d", leader.id)
+
+	// Wait for the write to reach every node before asserting anything about
+	// reads; a follower that has not applied it yet would 404 a stale read for
+	// reasons unrelated to the read contract.
+	waitConverged(t, nodes, "lin", "yes", 8*time.Second)
+
+	// The leader serves the linearizable read.
+	body, code, err := tryGetLinearizable(leader.addr(), "lin")
+	if err != nil {
+		t.Fatalf("linearizable read on leader: %v", err)
+	}
+	if code != http.StatusOK {
+		t.Fatalf("linearizable read on leader: code=%d body=%q", code, body)
+	}
+	if !bytes.Contains([]byte(body), []byte("yes")) {
+		t.Fatalf("leader returned %q, want the committed value", body)
+	}
+
+	// Followers refuse it, and say where to go instead.
+	for _, nd := range nodes {
+		if nd.id == leader.id {
+			continue
+		}
+		body, code, err := tryGetLinearizable(nd.addr(), "lin")
+		if err != nil {
+			t.Fatalf("node %d: %v", nd.id, err)
+		}
+		if code != http.StatusMisdirectedRequest {
+			t.Fatalf("follower %d answered a linearizable read: code=%d body=%q — "+
+				"only the leader can establish that a read is current",
+				nd.id, code, body)
+		}
+		if !bytes.Contains([]byte(body), []byte("leader")) {
+			t.Fatalf("follower %d refused without naming the leader: %q", nd.id, body)
+		}
+
+		// The same node still answers a stale read: opting out is explicit.
+		if _, code, _ := tryGet(nd.addr(), "lin"); code != http.StatusOK {
+			t.Fatalf("follower %d refused an explicit stale read: code=%d", nd.id, code)
+		}
 	}
 }

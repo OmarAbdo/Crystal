@@ -43,8 +43,8 @@ func (nilRPC) HandleInstallSnapshot(raft.InstallSnapshotRequest) raft.InstallSna
 
 func newTestServer(t *testing.T, node leaderChecker, peers map[int]string) *Server {
 	t.Helper()
-	return NewServer(node, make(chan engine.Proposal, 1), store.NewMemoryStateMachine(),
-		nilRPC{}, peers)
+	return NewServer(node, make(chan engine.Proposal, 1), make(chan engine.Read, 1),
+		store.NewMemoryStateMachine(), nilRPC{}, peers)
 }
 
 func postSet(t *testing.T, s *Server, key, value string) *httptest.ResponseRecorder {

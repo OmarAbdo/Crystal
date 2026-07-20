@@ -24,6 +24,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crystal/internal/config"
@@ -103,6 +104,30 @@ type Engine struct {
 	// election goroutine never blocks on a control loop busy elsewhere.
 	voteCh chan voteResult
 
+	// ---- Leadership evidence (shared by CheckQuorum and ReadIndex) ----
+
+	// roundSeq numbers replication rounds. A replicator claims one BEFORE it
+	// sends, so an ack carrying seq N proves the follower recognized our
+	// leadership at some point after round N began. Atomic: claimed from the
+	// per-peer replicator goroutines.
+	roundSeq atomic.Uint64
+
+	// ackCh carries proof-of-leadership from the replicators to the control loop.
+	ackCh chan ackReport
+
+	// lastAck is the control loop's record of that evidence, per peer. Written
+	// only by the control loop.
+	lastAck map[int]peerAck
+
+	// reads are pending linearizable reads, and readCh is how they arrive.
+	reads  []*readWaiter
+	readCh chan Read
+
+	// noopIndex is the index of the no-op this leader appended on election. Until
+	// it commits, the leader does not yet know the true commit frontier (§8), so
+	// no read may be served.
+	noopIndex int
+
 	// done is closed when Run returns. Election goroutines outlive a single
 	// election attempt and select on it so they cannot leak past shutdown.
 	done chan struct{}
@@ -148,6 +173,9 @@ func NewWithTransport(
 		replicators:  make(map[int]*peerReplicator),
 		stepDownCh:   make(chan int, len(cfg.Peers)+1),
 		voteCh:       make(chan voteResult, len(cfg.Peers)+1),
+		ackCh:        make(chan ackReport, 4*(len(cfg.Peers)+1)),
+		lastAck:      make(map[int]peerAck, len(cfg.Peers)),
+		readCh:       make(chan Read, 100),
 		done:         make(chan struct{}),
 		fatalf:       log.Fatalf,
 	}
@@ -182,6 +210,7 @@ func (e *Engine) Run(done <-chan struct{}) {
 		select {
 		case <-done:
 			e.failAllWaiters(ErrNotLeader)
+			e.failAllReads(ErrNotLeader)
 			return
 
 		case prop := <-e.proposals:
@@ -192,6 +221,12 @@ func (e *Engine) Run(done <-chan struct{}) {
 
 		case v := <-e.voteCh:
 			e.handleVoteResult(v)
+
+		case a := <-e.ackCh:
+			e.handleAck(a)
+
+		case r := <-e.readCh:
+			e.handleRead(r)
 
 		case <-ticker.C:
 			e.onTick()
@@ -319,7 +354,20 @@ func (e *Engine) onTick() {
 
 	e.applyCommitted()
 	e.maybeCompact()
-	e.sweepExpiredWaiters(time.Now())
+
+	// Reads depend on applied progress and on leadership evidence, both of which
+	// may have moved above.
+	e.fireReadWaiters()
+
+	// CheckQuorum runs after the read pass so a leader that is about to step down
+	// still gets one chance to satisfy reads it can legitimately serve.
+	if e.node.IsLeader() {
+		e.checkQuorum()
+	}
+
+	now := time.Now()
+	e.sweepExpiredWaiters(now)
+	e.sweepExpiredReads(now)
 }
 
 // reconcileLeadership makes the control loop's view of leadership agree with the
@@ -353,6 +401,9 @@ func (e *Engine) reconcileLeadership() {
 			e.stopReplicators()
 			e.failAllWaiters(ErrNotLeader)
 		}
+		// Reads are refused whether or not we were running replicators: an
+		// out-of-band stepdown can land between two ticks.
+		e.failAllReads(ErrNotLeader)
 		return
 	}
 
@@ -383,6 +434,7 @@ func (e *Engine) handleStepDown(higherTerm int) {
 	}
 	e.stopReplicators()
 	e.failAllWaiters(ErrNotLeader)
+	e.failAllReads(ErrNotLeader)
 }
 
 // applyCommitted applies all entries between LastApplied and CommitIndex.
@@ -588,12 +640,22 @@ func (e *Engine) becomeLeader(electionTerm, lastLogIndex int) {
 		return
 	}
 
-	// Append a no-op entry in our new term (§8) so prior-term entries can
-	// reach the commit frontier without waiting for the first client write.
+	// Evidence from a previous term proves nothing about this one, and the
+	// CheckQuorum clock must start now rather than judging us for silence we have
+	// not yet had a chance to break.
+	e.resetLeadershipEvidence()
+
+	// Append a no-op entry in our new term (§8) so prior-term entries can reach
+	// the commit frontier without waiting for the first client write. Its index
+	// is also the floor for reads: until it commits, this leader does not know
+	// the true commit frontier and must not answer a read.
+	e.noopIndex = 0
 	if noop, err := raft.EncodeCommand(raft.Command{Op: raft.OpNoop}); err != nil {
 		log.Printf("[ENGINE] Failed to encode leader no-op: %v", err)
-	} else if _, err := e.raftLog.AppendLeader(noop, electionTerm); err != nil {
+	} else if entry, err := e.raftLog.AppendLeader(noop, electionTerm); err != nil {
 		log.Printf("[ENGINE] Failed to append leader no-op: %v", err)
+	} else {
+		e.noopIndex = entry.Index
 	}
 
 	// Start the per-peer replication goroutines; they immediately send a

@@ -289,6 +289,31 @@ func (c *Cluster) SetVia(n *Node, key, value string, timeout time.Duration) erro
 	}
 }
 
+// Read performs a linearizable read through n's engine, returning the value once
+// leadership has been confirmed with a majority. It mirrors what the HTTP GET
+// handler does: ask the engine to establish that a local read is safe, then read.
+func (c *Cluster) Read(n *Node, key string, timeout time.Duration) (string, bool, error) {
+	c.t.Helper()
+	resultCh := make(chan error, 1)
+
+	select {
+	case n.Engine.ReadQueue() <- engine.Read{ResultCh: resultCh}:
+	case <-time.After(timeout):
+		return "", false, fmt.Errorf("node %d: read queue full", n.ID)
+	}
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			return "", false, err
+		}
+		v, ok := n.Store.Get(key)
+		return v, ok, nil
+	case <-time.After(timeout):
+		return "", false, fmt.Errorf("node %d: read timed out", n.ID)
+	}
+}
+
 // Isolate severs a node from the rest of the cluster in both directions. The
 // node keeps running — it ticks, times out, and campaigns into the void.
 func (c *Cluster) Isolate(id int) {

@@ -17,7 +17,14 @@ import (
 	"crystal/internal/store"
 )
 
-const writeTimeout = 2 * time.Second
+const (
+	writeTimeout = 2 * time.Second
+
+	// readTimeout bounds a linearizable read end to end. It is slightly longer
+	// than the engine's own read deadline so the engine's specific error
+	// (ErrReadTimeout) reaches the client instead of being masked by ours.
+	readTimeout = 3 * time.Second
+)
 
 // leaderHintHeader carries the leader's address on a redirect, so a client can
 // follow it without parsing prose.
@@ -27,6 +34,7 @@ const leaderHintHeader = "X-Raft-Leader"
 type Server struct {
 	node         leaderChecker
 	proposals    chan<- engine.Proposal
+	reads        chan<- engine.Read
 	stateMachine store.StateMachine
 	rpc          rpcHandler
 
@@ -59,6 +67,7 @@ type rpcHandler interface {
 func NewServer(
 	node leaderChecker,
 	proposals chan<- engine.Proposal,
+	reads chan<- engine.Read,
 	sm store.StateMachine,
 	rpc rpcHandler,
 	peers map[int]string,
@@ -66,6 +75,7 @@ func NewServer(
 	return &Server{
 		node:         node,
 		proposals:    proposals,
+		reads:        reads,
 		stateMachine: sm,
 		rpc:          rpc,
 		peers:        peers,
@@ -143,6 +153,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.submitAndRespond(w, raft.Command{Op: raft.OpDelete, Key: req.Key})
 }
 
+// handleGet serves a read. It is LINEARIZABLE by default (§8): the request is
+// admitted by the leader, held until a majority has confirmed that leadership is
+// still current, and only then answered from the local state machine.
+//
+// `?consistency=stale` opts out, reading local state immediately from whichever
+// node is asked. That is the old behavior, and it is genuinely useful — for
+// convergence checks, dashboards, anything that would rather have a fast answer
+// than a current one. It is opt-in because a client that has not thought about
+// staleness should not silently receive it.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET required", http.StatusMethodNotAllowed)
@@ -155,6 +174,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	switch consistency := r.URL.Query().Get("consistency"); consistency {
+	case "", "linearizable":
+		if !s.awaitLinearizableRead(w) {
+			return // response already written
+		}
+	case "stale":
+		// Read whatever this node has, leader or not.
+	default:
+		http.Error(w, fmt.Sprintf("unknown consistency %q: want linearizable or stale",
+			consistency), http.StatusBadRequest)
+		return
+	}
+
 	val, exists := s.stateMachine.Get(key)
 	if !exists {
 		http.Error(w, "key not found", http.StatusNotFound)
@@ -163,6 +195,49 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"value": val})
+}
+
+// awaitLinearizableRead blocks until the engine confirms a local read is safe.
+// It returns false if the request has been answered with an error instead.
+//
+// The engine deliberately does not see the key. Its only job is to establish
+// that this node's applied state is current as of the moment the read arrived;
+// what gets read afterwards is not a consensus concern.
+func (s *Server) awaitLinearizableRead(w http.ResponseWriter) bool {
+	if !s.node.IsLeader() {
+		// Only the leader can establish this. Send the client somewhere useful
+		// rather than quietly serving stale local state.
+		s.redirectToLeader(w)
+		return false
+	}
+
+	resultCh := make(chan error, 1)
+	select {
+	case s.reads <- engine.Read{ResultCh: resultCh}:
+	case <-time.After(readTimeout):
+		http.Error(w, "read queue full", http.StatusServiceUnavailable)
+		return false
+	}
+
+	select {
+	case err := <-resultCh:
+		switch {
+		case err == nil:
+			return true
+		case errors.Is(err, engine.ErrNotLeader):
+			s.redirectToLeader(w)
+		case errors.Is(err, engine.ErrReadTimeout):
+			// We could not prove we are still leader. Refusing is the point.
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return false
+
+	case <-time.After(readTimeout):
+		http.Error(w, "engine read timeout", http.StatusServiceUnavailable)
+		return false
+	}
 }
 
 // ---- Internal cluster handler ----

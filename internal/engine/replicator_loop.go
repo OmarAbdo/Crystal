@@ -66,6 +66,13 @@ func (pr *peerReplicator) replicateOnce() {
 		return
 	}
 
+	// Claim a round number BEFORE sending. This is the whole basis of the read
+	// guarantee: an ack proves the follower still recognized us as leader at some
+	// point after this instant. A round number taken after the reply arrives
+	// would prove only that the reply arrived, which says nothing about when the
+	// follower actually looked at its term.
+	startSeq := e.nextRoundSeq()
+
 	nextIndex := e.node.NextIndexFor(pr.peerID)
 
 	var followerTerm int
@@ -84,5 +91,16 @@ func (pr *peerReplicator) replicateOnce() {
 	if followerTerm > pr.term {
 		log.Printf("[REPLICATOR] Peer %d reported higher term %d > %d", pr.peerID, followerTerm, pr.term)
 		e.reportHigherTerm(followerTerm)
+		return
+	}
+
+	// A reply carrying OUR term is proof of leadership, whatever it says about
+	// the log. Even a rejected AppendEntries — a log-consistency failure — means
+	// the follower compared terms, found ours current, and did not know of a
+	// newer leader. That is exactly the assertion a quorum read needs.
+	//
+	// followerTerm == 0 means the peer was unreachable and tells us nothing.
+	if followerTerm == pr.term {
+		e.reportAck(pr.peerID, startSeq)
 	}
 }

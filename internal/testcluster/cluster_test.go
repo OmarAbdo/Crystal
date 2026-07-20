@@ -85,11 +85,9 @@ func TestMinorityPartitionElectsNoLeader(t *testing.T) {
 //
 // The mechanism is the same one §8 requires before serving a read-only request:
 // exchange heartbeats with a majority and step down if that fails (etcd calls it
-// CheckQuorum). Crystal has no such check — a partitioned leader keeps the role
-// indefinitely, which this test demonstrates and F19 tracks.
+// CheckQuorum). Implemented in F19, sharing its per-peer ack machinery with
+// ReadIndex.
 func TestPartitionedLeaderStepsDown(t *testing.T) {
-	t.Skip("F19: no CheckQuorum — a leader that loses its quorum never steps down")
-
 	c := New(t, Options{Size: 5})
 	leader := c.WaitLeader(5 * time.Second)
 
