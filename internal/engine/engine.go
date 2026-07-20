@@ -296,18 +296,40 @@ func (e *Engine) applyCommitted() {
 // maybeCompact triggers a snapshot + WAL truncation when the log has grown past
 // the threshold. Driven from the tick so a leader still compacts while a lagging
 // follower is unreachable — the situation that later forces an InstallSnapshot.
+//
+// It compacts to lastApplied, NOT commitIndex. A snapshot is a serialization of
+// the state machine, and the state machine reflects exactly the entries that have
+// been applied; §7 defines the last included index as "the last entry the state
+// machine had applied". The two boundaries diverge routinely on a follower, whose
+// commitIndex is advanced from the HTTP goroutine by SetFollowerCommitIndex and
+// can jump between applyCommitted and maybeCompact within a single tick.
+// Compacting to commitIndex there would write a snapshot claiming entries whose
+// effects it does not contain, and then delete the very entries needed to repair
+// the gap.
 func (e *Engine) maybeCompact() {
-	commitIndex, _ := e.node.CommitAndApplyBoundary()
-	if e.raftLog.NeedsCompaction(commitIndex) {
-		e.compact(commitIndex)
+	_, lastApplied := e.node.CommitAndApplyBoundary()
+	if e.raftLog.NeedsCompaction(lastApplied) {
+		e.compact(lastApplied)
 	}
 }
 
-// compact takes a snapshot of the state machine and truncates the WAL.
-func (e *Engine) compact(commitIndex int) {
-	term := e.raftLog.TermAt(commitIndex)
+// compact takes a snapshot of the state machine at snapshotIndex (which must be
+// lastApplied) and truncates the WAL up to it.
+func (e *Engine) compact(snapshotIndex int) {
+	// TermAt returns 0 for an index it cannot resolve. Compacting on that answer
+	// persists a snapshot whose LastIncludedTerm is a fabrication, and
+	// TruncateBeforeIndex then bails out on its already-compacted check — so the
+	// lie outlives the call. After a restart RestoreOffset seeds term 0 as the
+	// snapshot boundary and every AppendEntries consistency check against that
+	// boundary fails, permanently. Refuse instead.
+	term := e.raftLog.TermAt(snapshotIndex)
+	if term == 0 {
+		log.Printf("[ENGINE] Skipping compaction: no known term for index %d", snapshotIndex)
+		return
+	}
+
 	meta := store.SnapshotMeta{
-		LastIncludedIndex: commitIndex,
+		LastIncludedIndex: snapshotIndex,
 		LastIncludedTerm:  term,
 	}
 
@@ -316,12 +338,12 @@ func (e *Engine) compact(commitIndex int) {
 		return
 	}
 
-	if err := e.raftLog.TruncateBeforeIndex(commitIndex, term); err != nil {
+	if err := e.raftLog.TruncateBeforeIndex(snapshotIndex, term); err != nil {
 		log.Printf("[ENGINE] WAL truncation failed: %v", err)
 		return
 	}
 
-	log.Printf("[ENGINE] Compacted log up to index %d", commitIndex)
+	log.Printf("[ENGINE] Compacted log up to index %d", snapshotIndex)
 }
 
 // ---- Elections ----

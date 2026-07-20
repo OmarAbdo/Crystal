@@ -377,13 +377,14 @@ func (rl *RaftLog) SetCompactionThreshold(n int) {
 	rl.compactionThreshold = n
 }
 
-// NeedsCompaction returns true when the log has grown past the threshold.
-// The engine calls this after each commit to decide whether to trigger
-// a snapshot + log truncation cycle.
-func (rl *RaftLog) NeedsCompaction(commitIndex int) bool {
+// NeedsCompaction returns true when the log has grown past the threshold and
+// there is something to compact. appliedIndex is the state machine's applied
+// boundary — the highest index a snapshot may legally cover (§7) — so a log that
+// is long but entirely unapplied is correctly left alone.
+func (rl *RaftLog) NeedsCompaction(appliedIndex int) bool {
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
-	return len(rl.cache) >= rl.compactionThreshold && commitIndex > 0
+	return len(rl.cache) >= rl.compactionThreshold && appliedIndex > 0
 }
 
 // TruncateBeforeIndex discards all entries with Index <= snapshotIndex from both
