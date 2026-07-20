@@ -22,6 +22,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"crystal/internal/fsutil"
 )
 
 // RaftNode holds the consensus state for one node.
@@ -626,15 +628,20 @@ func (rn *RaftNode) savePersistentState() error {
 
 // savePersistentStateLocked writes term+votedFor to disk.
 // Caller must hold rn.mu (write).
+//
+// This write must be DURABLE, not merely atomic. Figure 2 requires currentTerm
+// and votedFor to be on stable storage before the node responds to an RPC; if
+// the record is only in the page cache, a power cut resurrects the node in a
+// term it has already voted in, it votes a second time, and two leaders are
+// elected for that term. fsutil.WriteFileAtomic fsyncs both the file and its
+// directory so the record — and the rename that publishes it — actually survive.
 func (rn *RaftNode) savePersistentStateLocked() error {
 	data, err := json.Marshal(rn.persistent)
 	if err != nil {
 		return err
 	}
-	// Write to temp file then rename for atomic update.
-	tmp := rn.metadataPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0666); err != nil {
-		return fmt.Errorf("write raft metadata tmp: %w", err)
+	if err := fsutil.WriteFileAtomic(rn.metadataPath, data, 0666); err != nil {
+		return fmt.Errorf("persist raft metadata: %w", err)
 	}
-	return os.Rename(tmp, rn.metadataPath)
+	return nil
 }

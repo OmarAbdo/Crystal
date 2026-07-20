@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"crystal/internal/fsutil"
 )
 
 // SnapshotMeta records which log index and term this snapshot covers.
@@ -37,9 +39,12 @@ func NewSnapshotManager(path string) *SnapshotManager {
 	return &SnapshotManager{path: path}
 }
 
-// Write serializes the state machine snapshot to disk atomically.
-// "Atomically" here means: write to .tmp, fsync, rename. A crash
-// mid-write leaves the previous snapshot intact.
+// Write serializes the state machine snapshot to disk atomically and durably:
+// write to .tmp, fsync the file, rename, fsync the directory. A crash mid-write
+// leaves the previous snapshot intact; a crash just after leaves the new one,
+// never neither. The directory fsync matters because the log is truncated on the
+// strength of this snapshot existing — losing the rename would discard entries
+// covered by a snapshot that is no longer reachable.
 func (sm *SnapshotManager) Write(meta SnapshotMeta, stateMachine StateMachine) error {
 	raw, err := stateMachine.Snapshot()
 	if err != nil {
@@ -57,24 +62,10 @@ func (sm *SnapshotManager) Write(meta SnapshotMeta, stateMachine StateMachine) e
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 
-	tmp := sm.path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return fmt.Errorf("create snapshot tmp: %w", err)
+	if err := fsutil.WriteFileAtomic(sm.path, data, 0666); err != nil {
+		return fmt.Errorf("persist snapshot: %w", err)
 	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return fmt.Errorf("write snapshot: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("fsync snapshot: %w", err)
-	}
-	f.Close()
-
-	return os.Rename(tmp, sm.path)
+	return nil
 }
 
 // Read loads the most recent snapshot from disk.

@@ -29,7 +29,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
+
+	"crystal/internal/fsutil"
 )
 
 const defaultCompactionThreshold = 1000
@@ -571,6 +574,13 @@ func (rl *RaftLog) rewriteWALLocked() error {
 	}
 	if err := os.Rename(tmpPath, rl.walPath); err != nil {
 		return fmt.Errorf("rename WAL rewrite into place: %w", err)
+	}
+	// The rename must itself be durable. The temp file's contents are fsynced
+	// above, but until the directory entry is on stable storage a crash can
+	// resurrect the pre-rewrite WAL — reviving entries this rewrite deliberately
+	// discarded (a follower's conflicting suffix, or a compacted prefix).
+	if err := fsutil.SyncDir(filepath.Dir(rl.walPath)); err != nil {
+		return fmt.Errorf("fsync WAL directory after rewrite: %w", err)
 	}
 
 	// Reopen the append handle on the freshly written WAL.
