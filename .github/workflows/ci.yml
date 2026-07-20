@@ -1,0 +1,38 @@
+name: CI
+
+# Runs on Linux specifically so that -race is available. The race detector needs
+# cgo, which is not configured on the primary development machine (Windows), so
+# CI is the only place data races are actually detected. F1 -- concurrent RPC
+# receivers racing on the term -- is the kind of bug that regresses silently and
+# is caught by nothing else.
+
+on:
+  push:
+    branches: [main, "raft-*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit and harness tests (race)
+        run: go test -race -timeout 10m ./...
+
+      # The harness exercises elections and partitions, which are timing
+      # sensitive. Repeating it catches the flake that a single green run hides.
+      - name: Cluster harness (race, repeated)
+        run: go test -race -count=3 -timeout 15m ./internal/testcluster/
+
+      - name: Integration tests (race)
+        run: go test -race -tags integration -timeout 15m ./internal/integration/
