@@ -108,7 +108,12 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
       *Test:* `TestPartitionedLeaderStepsDown`, currently `t.Skip`ped in
       `internal/testcluster/cluster_test.go` with the reason inline.
 
-- [ ] **F4 — `InstallSnapshotResponse` has no success flag.**
+- [x] **F4 — `InstallSnapshotResponse` has no success flag.** *(done `b47d2c8`)*
+      — added `Success bool`; leader advances progress only on it; "already
+      covered" reports success deliberately (the follower does hold that data).
+      7 tests.
+
+      Original analysis:
       ([types.go:89](../internal/raft/types.go#L89)) Every failure path in the
       receiver returns the byte-identical `{Term}`, so the leader cannot tell
       "restored" from "restore failed" and unconditionally runs
@@ -121,7 +126,14 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
 
 ## Phase 5 — Client-facing protocol (§8)
 
-- [ ] **F10 — redirect names the wrong node.**
+- [x] **F10 — redirect names the wrong node.** *(done `c1cd6cf`)* — added
+      `RaftNode.CurrentLeader()`, gave the `Server` the peer map so it can turn a
+      leader ID into a connectable address, and added the `X-Raft-Leader` header.
+      Three distinct cases (addressable / known-by-ID-only / genuinely
+      leaderless). The post-stepdown `ErrNotLeader` path redirects the same way.
+      Corrected the 403-vs-421 comment drift. 4 tests.
+
+      Original analysis:
       ([http.go:86](../internal/transport/http.go#L86), [:118](../internal/transport/http.go#L118))
       `route to node %d` prints `s.node.NodeID()` — the node that just rejected
       the request. §8: the server should "supply information about the most
