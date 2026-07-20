@@ -8,3 +8,7 @@ var ErrNotLeader = errors.New("not the leader")
 
 // ErrCommitTimeout is returned when quorum was not reached within the deadline.
 var ErrCommitTimeout = errors.New("commit timeout: lost quorum or cluster degraded")
+
+// errUnreachable stands in for a transport failure in tests that never intend
+// to exercise the network.
+var errUnreachable = errors.New("peer unreachable")

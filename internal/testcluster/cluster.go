@@ -356,3 +356,10 @@ func (c *Cluster) dumpState() {
 	}
 	c.t.Logf("dir: %s", filepath.Dir(c.Nodes[1].DataDir))
 }
+
+// SetBlackholeDelay makes cut links hang for d before reporting failure, rather
+// than failing at once. A refused connection and a black hole are different
+// failures: the first costs the caller nothing, the second costs it a full RPC
+// timeout. Code that waits on a peer instead of on a quorum only misbehaves
+// against the second.
+func (c *Cluster) SetBlackholeDelay(d time.Duration) { c.net.setBlackholeDelay(d) }

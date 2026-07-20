@@ -13,9 +13,11 @@ func newWaiterEngine() *Engine {
 	return &Engine{}
 }
 
+// mkWaiter builds a waiter in term 1; tests that care about term mismatch set
+// the field explicitly.
 func mkWaiter(index int, deadline time.Time) (*waiter, chan error) {
 	ch := make(chan error, 1)
-	return &waiter{index: index, resultCh: ch, deadline: deadline}, ch
+	return &waiter{index: index, term: 1, resultCh: ch, deadline: deadline}, ch
 }
 
 func TestFireCommittedWaiters_ResolvesAtOrBelowCommit(t *testing.T) {
@@ -28,7 +30,7 @@ func TestFireCommittedWaiters_ResolvesAtOrBelowCommit(t *testing.T) {
 	e.waiters = []*waiter{w1, w2, w3}
 
 	// Commit index 2 → waiters 1 and 2 fire with nil, waiter 3 stays pending.
-	e.fireCommittedWaiters(2)
+	e.fireCommittedWaiters(2, 1)
 
 	if err := recvNoBlock(t, c1); err != nil {
 		t.Fatalf("waiter 1: got %v, want nil (committed)", err)
@@ -101,5 +103,32 @@ func recvNoBlock(t *testing.T, ch chan error) error {
 	default:
 		t.Fatalf("expected a value on result channel, none present")
 		return nil
+	}
+}
+
+// A waiter registered under one term must not be acknowledged once the term has
+// moved on. The index it is waiting for may now hold a different leader's entry,
+// and committing that entry says nothing about this client's write.
+func TestFireCommittedWaiters_TermMismatchFails(t *testing.T) {
+	e := newWaiterEngine()
+	future := time.Now().Add(time.Minute)
+
+	stale, staleCh := mkWaiter(1, future)
+	stale.term = 1
+	current, currentCh := mkWaiter(2, future)
+	current.term = 2
+	e.waiters = []*waiter{stale, current}
+
+	// We are now leader of term 2, and index 2 has committed.
+	e.fireCommittedWaiters(2, 2)
+
+	if err := recvNoBlock(t, staleCh); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("stale-term waiter: got %v, want ErrNotLeader", err)
+	}
+	if err := recvNoBlock(t, currentCh); err != nil {
+		t.Fatalf("current-term waiter: got %v, want nil", err)
+	}
+	if len(e.waiters) != 0 {
+		t.Fatalf("expected all waiters resolved, %d remain", len(e.waiters))
 	}
 }

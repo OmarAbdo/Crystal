@@ -58,8 +58,15 @@ type Proposal struct {
 
 // waiter couples a client's result channel to the log index it is waiting to
 // have committed, plus a deadline after which the proposal fails.
+//
+// term is the leader term the entry was appended in, and it is what makes the
+// acknowledgement honest. An index alone does not identify an entry: if this
+// node is deposed and later re-elected, the index the client is waiting on may
+// by then hold a DIFFERENT leader's entry. Acking on index alone would tell the
+// client its write committed when what actually committed was somebody else's.
 type waiter struct {
 	index    int
+	term     int
 	resultCh chan error
 	deadline time.Time
 }
@@ -80,13 +87,25 @@ type Engine struct {
 	waiters         []*waiter     // pending client proposals, ascending by index
 
 	// Per-peer replication goroutines, live only while we are leader.
-	replicators map[int]*peerReplicator
-	replWG      sync.WaitGroup
+	// replicatorsTerm is the term they were started for; a mismatch against the
+	// node's current term means they are stale and must be replaced, not reused.
+	replicators     map[int]*peerReplicator
+	replicatorsTerm int
+	replWG          sync.WaitGroup
 
 	// stepDownCh carries a higher term observed by any replication goroutine.
 	// The control loop drains it and steps down. Buffered so a replicator never
 	// blocks reporting it.
 	stepDownCh chan int
+
+	// voteCh carries RequestVote replies back to the control loop, which is the
+	// only goroutine that tallies them. Buffered for one reply per peer so an
+	// election goroutine never blocks on a control loop busy elsewhere.
+	voteCh chan voteResult
+
+	// done is closed when Run returns. Election goroutines outlive a single
+	// election attempt and select on it so they cannot leak past shutdown.
+	done chan struct{}
 
 	// fatalf halts the node on a condition from which it cannot continue
 	// correctly. It is a field only so tests can observe the halt instead of
@@ -128,6 +147,8 @@ func NewWithTransport(
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano() + int64(node.NodeID()))),
 		replicators:  make(map[int]*peerReplicator),
 		stepDownCh:   make(chan int, len(cfg.Peers)+1),
+		voteCh:       make(chan voteResult, len(cfg.Peers)+1),
+		done:         make(chan struct{}),
 		fatalf:       log.Fatalf,
 	}
 	e.resetElectionTimeout()
@@ -154,6 +175,8 @@ func (e *Engine) Run(done <-chan struct{}) {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	defer e.stopReplicators()
+	// Release any election goroutine still parked on voteCh.
+	defer close(e.done)
 
 	for {
 		select {
@@ -166,6 +189,9 @@ func (e *Engine) Run(done <-chan struct{}) {
 
 		case higherTerm := <-e.stepDownCh:
 			e.handleStepDown(higherTerm)
+
+		case v := <-e.voteCh:
+			e.handleVoteResult(v)
 
 		case <-ticker.C:
 			e.onTick()
@@ -199,6 +225,7 @@ func (e *Engine) handleProposal(prop Proposal) {
 
 	e.waiters = append(e.waiters, &waiter{
 		index:    entry.Index,
+		term:     term,
 		resultCh: prop.ResultCh,
 		deadline: time.Now().Add(proposalTimeout),
 	})
@@ -211,15 +238,27 @@ func (e *Engine) handleProposal(prop Proposal) {
 // fireCommittedWaiters resolves every waiter whose index is now committed,
 // removing it from the pending list. Called from the control loop after commit
 // advancement.
-func (e *Engine) fireCommittedWaiters(commitIndex int) {
+//
+// currentTerm is checked against each waiter's term because a committed index is
+// not proof that the CLIENT's entry committed there. If this node was deposed and
+// re-elected between the proposal and now, the index may hold an entry from the
+// intervening leader — committing that entry says nothing about the write this
+// waiter is holding a client on. Acknowledging it would be a false positive, and
+// a false positive on a write acknowledgement is a linearizability violation the
+// client has no way to detect.
+func (e *Engine) fireCommittedWaiters(commitIndex, currentTerm int) {
 	if len(e.waiters) == 0 {
 		return
 	}
 	kept := e.waiters[:0]
 	for _, w := range e.waiters {
-		if w.index <= commitIndex {
+		switch {
+		case w.term != currentTerm:
+			// The term moved on; this entry's fate is no longer ours to report.
+			w.resultCh <- ErrNotLeader
+		case w.index <= commitIndex:
 			w.resultCh <- nil
-		} else {
+		default:
 			kept = append(kept, w)
 		}
 	}
@@ -265,11 +304,15 @@ func (e *Engine) failAllWaiters(err error) {
 //
 // Both roles apply committed entries and expire stale waiters.
 func (e *Engine) onTick() {
-	if e.node.IsLeader() {
+	// Reconcile first: leadership can change out from under the control loop on
+	// an HTTP goroutine, and everything below assumes the two agree.
+	e.reconcileLeadership()
+
+	if role, term := e.node.State(); role == raft.Leader {
 		localLatest := e.raftLog.LatestIndex()
-		e.node.AdvanceCommitIndex(localLatest, e.raftLog.TermAt, e.node.CurrentTerm())
+		e.node.AdvanceCommitIndex(localLatest, e.raftLog.TermAt, term)
 		commitIndex, _ := e.node.CommitAndApplyBoundary()
-		e.fireCommittedWaiters(commitIndex)
+		e.fireCommittedWaiters(commitIndex, term)
 	} else if e.node.TimeSinceContact() >= e.electionTimeout {
 		e.runElection()
 	}
@@ -279,11 +322,60 @@ func (e *Engine) onTick() {
 	e.sweepExpiredWaiters(time.Now())
 }
 
+// reconcileLeadership makes the control loop's view of leadership agree with the
+// node's, and is the first thing every tick does.
+//
+// Role changes have two sources. The control loop causes them deliberately, via
+// runElection and handleStepDown. But an inbound RPC also causes them: a
+// higher-term AppendEntries or RequestVote arrives on an HTTP goroutine and
+// deposes this node inside the receiver, and the control loop is never told. The
+// consequences are not subtle:
+//
+//   - The per-peer replicators keep running, still carrying the term they were
+//     started for. They no-op while IsLeader is false, but they are still there.
+//   - On re-election, startReplicators used to short-circuit on a non-empty map,
+//     so those stale-term goroutines resumed under the NEW term while reporting
+//     against the OLD one. Every ordinary reply then looked like a higher term
+//     and triggered a stepdown — a leader deposing itself moments after winning.
+//   - Waiters registered under the old term survive, and can be acknowledged
+//     against an index that now belongs to a different leader's entry.
+//
+// Rather than trying to intercept every path that can depose the node, the
+// control loop simply observes the truth once per tick and makes its own state
+// match. Reconciling is idempotent, so it costs a comparison in the common case.
+func (e *Engine) reconcileLeadership() {
+	role, term := e.node.State()
+
+	if role != raft.Leader {
+		// Not (or no longer) leader: tear down anything that implies we are.
+		if len(e.replicators) > 0 {
+			log.Printf("[ENGINE] Reconciling: no longer leader, stopping replicators")
+			e.stopReplicators()
+			e.failAllWaiters(ErrNotLeader)
+		}
+		return
+	}
+
+	// Leader, but the replicators belong to an older term — or are missing
+	// entirely because we were promoted somewhere other than runElection.
+	// startReplicators replaces a stale set rather than short-circuiting.
+	if len(e.replicators) == 0 || e.replicatorsTerm != term {
+		e.startReplicators()
+	}
+}
+
 // handleStepDown reacts to a higher term observed by a replication goroutine:
 // step down to follower, stop the replicators, and fail all pending proposals.
+//
+// The guard is a plain term comparison. It used to also require !IsLeader, which
+// inverted the intent: a stale report whose term was NOT higher than ours would
+// pass the guard precisely when we were the leader — the one case where acting on
+// it is most damaging. stepDownCh is buffered, so a report can outlive the
+// situation that produced it and arrive after this node has legitimately won a
+// new election at that same term.
 func (e *Engine) handleStepDown(higherTerm int) {
-	if higherTerm <= e.node.CurrentTerm() && !e.node.IsLeader() {
-		return // already handled / stale signal
+	if higherTerm <= e.node.CurrentTerm() {
+		return // stale or already handled
 	}
 	log.Printf("[ENGINE] Stepping down: observed higher term %d", higherTerm)
 	if err := e.node.BecomeFollower(higherTerm, 0); err != nil {
@@ -394,14 +486,20 @@ func (e *Engine) compact(snapshotIndex int) {
 
 // ---- Elections ----
 
-// runElection conducts one election attempt (§5.2): transition to candidate,
-// bump the term, vote for self, request votes from all peers in parallel, and
-// become leader on a majority. A newer term observed in any response steps us
-// back down to follower. Regardless of outcome, a fresh randomized timeout is
-// armed so a failed election retries after a different delay.
+// runElection starts one election attempt (§5.2) and RETURNS IMMEDIATELY.
 //
-// Vote gathering is done inline (bounded, one round) rather than via the
-// per-peer replicators, which only run while we are leader.
+// It used to gather votes inline and end in wg.Wait(), which was wrong twice
+// over. It blocked the control loop for as long as the slowest peer took to
+// answer — up to the full RPC timeout, during which no proposal, tick, apply or
+// stepdown was processed. And it waited for ALL peers when §5.2 says a candidate
+// wins "if it receives votes from a majority", i.e. the moment the majority
+// arrives. With a 300–600ms election timeout and a 1s RPC timeout, a single
+// black-holed peer made every election overrun its own timeout, so elections
+// re-armed before they could finish and the cluster could fail to elect at all.
+//
+// Now each peer's RequestVote runs on its own goroutine and reports back through
+// voteCh; the control loop tallies in handleVoteResult and promotes on the vote
+// that reaches a majority, whenever that is.
 func (e *Engine) runElection() {
 	term, err := e.node.BecomeCandidate()
 	if err != nil {
@@ -410,8 +508,11 @@ func (e *Engine) runElection() {
 		return
 	}
 
-	lastLogIndex := e.raftLog.LatestIndex()
-	lastLogTerm := e.raftLog.LatestTerm()
+	// Arm the next timeout now: if this election stalls, the retry is already
+	// scheduled and does not depend on anything completing.
+	e.resetElectionTimeout()
+
+	lastLogIndex, lastLogTerm := e.raftLog.LastLogState()
 	req := raft.RequestVoteRequest{
 		Term:         term,
 		CandidateID:  e.node.NodeID(),
@@ -419,72 +520,104 @@ func (e *Engine) runElection() {
 		LastLogTerm:  lastLogTerm,
 	}
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	highestTerm := term
-	won := false
+	// A single-node cluster has already reached a majority with its own vote and
+	// has nobody to ask, so it must win here rather than waiting for a reply that
+	// will never come.
+	if len(e.peers) == 0 {
+		e.becomeLeader(term, lastLogIndex)
+		return
+	}
 
 	for peerID, addr := range e.peers {
-		wg.Add(1)
 		go func(pid int, a string) {
-			defer wg.Done()
 			resp, ok := e.replicator.RequestVoteFrom(pid, a, req)
 			if !ok {
 				return
 			}
-			mu.Lock()
-			if resp.Term > highestTerm {
-				highestTerm = resp.Term
-			}
-			mu.Unlock()
-			if resp.VoteGranted {
-				if e.node.RecordVoteAndCheckMajority(term) {
-					mu.Lock()
-					won = true
-					mu.Unlock()
-				}
+			select {
+			case e.voteCh <- voteResult{electionTerm: term, resp: resp}:
+			case <-e.done:
 			}
 		}(peerID, addr)
 	}
-	wg.Wait()
+}
 
-	e.resetElectionTimeout()
+// voteResult carries one RequestVote reply back to the control loop.
+// electionTerm is the term the vote was SOLICITED in, which is what makes a
+// late reply from an abandoned election identifiable and discardable.
+type voteResult struct {
+	electionTerm int
+	resp         raft.RequestVoteResponse
+}
 
-	if highestTerm > term {
-		log.Printf("[ENGINE] Election lost: observed higher term %d", highestTerm)
-		if err := e.node.BecomeFollower(highestTerm, 0); err != nil {
+// handleVoteResult tallies one vote on the control loop. It is the only place
+// leadership is assumed, so the decision needs no lock of its own.
+func (e *Engine) handleVoteResult(v voteResult) {
+	// A reply to an election we have already moved past tells us nothing.
+	role, term := e.node.State()
+	if term != v.electionTerm || role != raft.Candidate {
+		return
+	}
+
+	if v.resp.Term > term {
+		log.Printf("[ENGINE] Election lost: observed higher term %d", v.resp.Term)
+		if err := e.node.BecomeFollower(v.resp.Term, 0); err != nil {
 			log.Printf("[ENGINE] Stepdown persist failed: %v", err)
 		}
 		return
 	}
 
-	// Assume leadership only if we won AND BecomeLeader confirms we are still a
-	// candidate in this election's term (atomic check inside BecomeLeader,
-	// closing the stepdown race).
-	if won && e.node.BecomeLeader(term, lastLogIndex) {
-		// Append a no-op entry in our new term (§8) so prior-term entries can
-		// reach the commit frontier without waiting for the first client write.
-		if noop, err := raft.EncodeCommand(raft.Command{Op: raft.OpNoop}); err != nil {
-			log.Printf("[ENGINE] Failed to encode leader no-op: %v", err)
-		} else if _, err := e.raftLog.AppendLeader(noop, term); err != nil {
-			log.Printf("[ENGINE] Failed to append leader no-op: %v", err)
-		}
-
-		// Start the per-peer replication goroutines; they immediately send a
-		// first round that both ships the no-op and asserts authority.
-		e.startReplicators()
+	if !v.resp.VoteGranted {
+		return
 	}
+
+	// Promote on the vote that reaches the majority — not on the last vote to
+	// arrive (§5.2).
+	if e.node.RecordVoteAndCheckMajority(v.electionTerm) {
+		e.becomeLeader(v.electionTerm, e.raftLog.LatestIndex())
+	}
+}
+
+// becomeLeader promotes this node if it is still a candidate in electionTerm,
+// appends the term's no-op, and starts replication.
+func (e *Engine) becomeLeader(electionTerm, lastLogIndex int) {
+	// BecomeLeader re-checks under the node lock that we are still a candidate in
+	// this term, so a stepdown that landed between the tally and here cannot be
+	// stomped.
+	if !e.node.BecomeLeader(electionTerm, lastLogIndex) {
+		return
+	}
+
+	// Append a no-op entry in our new term (§8) so prior-term entries can
+	// reach the commit frontier without waiting for the first client write.
+	if noop, err := raft.EncodeCommand(raft.Command{Op: raft.OpNoop}); err != nil {
+		log.Printf("[ENGINE] Failed to encode leader no-op: %v", err)
+	} else if _, err := e.raftLog.AppendLeader(noop, electionTerm); err != nil {
+		log.Printf("[ENGINE] Failed to append leader no-op: %v", err)
+	}
+
+	// Start the per-peer replication goroutines; they immediately send a
+	// first round that both ships the no-op and asserts authority.
+	e.startReplicators()
 }
 
 // ---- Per-peer replication goroutine lifecycle ----
 
-// startReplicators launches one replication goroutine per peer. Idempotent: if
-// replicators are already running it does nothing. Called on becoming leader.
+// startReplicators launches one replication goroutine per peer for the node's
+// current term. If replicators from an EARLIER term are still running they are
+// stopped first: reusing them would leave each goroutine comparing follower
+// replies against a term the cluster has left behind, so every ordinary reply
+// would read as a higher term and trigger a spurious stepdown.
 func (e *Engine) startReplicators() {
-	if len(e.replicators) > 0 {
-		return
-	}
 	term := e.node.CurrentTerm()
+	if len(e.replicators) > 0 {
+		if e.replicatorsTerm == term {
+			return
+		}
+		log.Printf("[ENGINE] Replacing replicators from stale term %d with term %d",
+			e.replicatorsTerm, term)
+		e.stopReplicators()
+	}
 	for peerID, addr := range e.peers {
 		pr := &peerReplicator{
 			engine: e,
@@ -498,6 +631,7 @@ func (e *Engine) startReplicators() {
 		e.replWG.Add(1)
 		go pr.run(&e.replWG)
 	}
+	e.replicatorsTerm = term
 	log.Printf("[ENGINE] Started %d replication goroutines for term %d", len(e.replicators), term)
 }
 
@@ -512,6 +646,7 @@ func (e *Engine) stopReplicators() {
 	}
 	e.replWG.Wait()
 	e.replicators = make(map[int]*peerReplicator)
+	e.replicatorsTerm = 0
 }
 
 // notifyReplicators nudges every replication goroutine that new work is

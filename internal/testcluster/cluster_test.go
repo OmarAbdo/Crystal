@@ -144,3 +144,83 @@ func TestProgressUnderPacketLoss(t *testing.T) {
 	}
 	c.WaitApplied(c.ids(), "lossy", "ok", 10*time.Second)
 }
+
+// ---- F9: elections must not wait for the slowest peer ----
+
+// §5.2: a candidate wins "if it receives votes from a majority of the servers".
+// The majority, not everyone. Waiting for all peers made every election as slow
+// as the slowest one — and against a black-holed peer that means the full RPC
+// timeout (1s), which is longer than the election timeout itself (300–600ms), so
+// elections re-armed before they could finish.
+//
+// One peer here is cut in both directions but still running, so its RequestVote
+// never fails fast the way a refused connection would; it simply never answers.
+// The remaining two nodes are a majority of three and must elect promptly.
+// Five nodes, two of them black-holed, leaving exactly a majority of three. The
+// three must elect among themselves without ever waiting on the two that will
+// never answer.
+func TestElectionCompletesWithoutUnreachablePeer(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	c.WaitLeader(5 * time.Second)
+
+	// The unreachable peers must HANG, not fail fast. A refused connection costs
+	// the caller nothing, so it would not distinguish waiting-for-a-quorum from
+	// waiting-for-everyone; only a peer that accepts and never answers does.
+	const blackhole = 2 * time.Second
+	c.SetBlackholeDelay(blackhole)
+
+	// Black-hole one node, then remove whoever is leading among the rest. That
+	// leaves three reachable nodes — still a majority of five, so an election
+	// must succeed.
+	c.Isolate(5)
+	leader := c.WaitLeaderAmong(c.Others(5), 5*time.Second)
+	c.Isolate(leader.ID)
+
+	remaining := c.Others(5, leader.ID)
+	start := time.Now()
+	c.WaitLeaderAmong(remaining, 10*time.Second)
+	elapsed := time.Since(start)
+
+	// Waiting for all peers would cost the full blackhole delay per attempt on top
+	// of the election timeout that triggered it. Waiting for a majority costs one
+	// election timeout (300–600ms) plus a round trip. The bound sits between them.
+	if elapsed > blackhole {
+		t.Fatalf("election took %s with two unreachable peers, which is at least "+
+			"the %s a black-holed peer costs — the candidate is waiting for every "+
+			"peer instead of for a majority", elapsed, blackhole)
+	}
+	t.Logf("elected in %s with two of five nodes black-holed for %s", elapsed, blackhole)
+}
+
+// The control loop must keep serving while an election is in flight. If vote
+// gathering blocks the loop, a write submitted moments later waits on the
+// election instead of on replication.
+func TestControlLoopResponsiveDuringElection(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	// Slow every RPC so elections and replication both take real time.
+	c.SetDelay(40 * time.Millisecond)
+	c.Isolate(leader.ID)
+
+	next := c.WaitLeaderAmong(c.Others(leader.ID), 5*time.Second)
+
+	// The deposed leader's control loop must still be answering its own queue
+	// rather than parked inside a vote round.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.SetVia(leader, "ignored", "value", 2*time.Second)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deposed node's control loop never answered a proposal — it is " +
+			"blocked inside an election")
+	}
+
+	// And the live cluster keeps making progress throughout.
+	if err := c.SetVia(next, "k", "v", 3*time.Second); err != nil {
+		t.Fatalf("write to the new leader failed: %v", err)
+	}
+}

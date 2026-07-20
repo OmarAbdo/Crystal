@@ -42,6 +42,11 @@ type fakeNet struct {
 	cut      map[string]bool       // "from→to" → dropped
 	dropRate float64               // probability an otherwise-deliverable RPC is lost
 	delay    time.Duration         // per-RPC delivery delay
+
+	// blackholeDelay is how long a CUT link stalls before reporting failure. Zero
+	// means fail immediately (a refused connection); non-zero models a peer that
+	// accepts and never answers, so the caller pays its full RPC timeout.
+	blackholeDelay time.Duration
 	rng      *rand.Rand
 }
 
@@ -113,6 +118,14 @@ func (n *fakeNet) setDropRate(p float64) {
 	n.dropRate = p
 }
 
+// setBlackholeDelay makes cut links hang for d before failing, instead of
+// failing at once.
+func (n *fakeNet) setBlackholeDelay(d time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.blackholeDelay = d
+}
+
 func (n *fakeNet) setDelay(d time.Duration) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -125,8 +138,14 @@ func (n *fakeNet) setDelay(d time.Duration) {
 func (n *fakeNet) route(from, to string) (rpcHandler, time.Duration, error) {
 	n.mu.Lock()
 	if n.cut[linkKey(from, to)] {
+		hang := n.blackholeDelay
 		n.mu.Unlock()
-		return nil, 0, fmt.Errorf("link %s is cut", linkKey(from, to))
+		// A cut link fails immediately by default, which models a refused
+		// connection. With blackholeDelay set it instead hangs first, modelling a
+		// peer that accepts the connection and never answers — the failure that
+		// actually costs a caller its RPC timeout, and the one that matters for
+		// any code that waits on a peer rather than on a quorum.
+		return nil, hang, fmt.Errorf("link %s is cut", linkKey(from, to))
 	}
 	if n.dropRate > 0 && n.rng.Float64() < n.dropRate {
 		n.mu.Unlock()
@@ -171,11 +190,11 @@ func deliver[Req any, Resp any](
 	var zero Resp
 
 	h, delay, err := t.net.route(t.from, to)
-	if err != nil {
-		return zero, err
-	}
 	if delay > 0 {
 		time.Sleep(delay)
+	}
+	if err != nil {
+		return zero, err
 	}
 
 	resp := call(h, req)
