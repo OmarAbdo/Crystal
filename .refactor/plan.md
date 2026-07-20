@@ -232,12 +232,24 @@ meant to validate. Build it fresh; do not lift it from the stash.
 
 ---
 
-## Phase 4 — Leadership has one owner
+## Phase 4 — Leadership has one owner ✅
+
+> **Landed as one commit (`f0f47e1`).** These are four symptoms of a single
+> cause — leadership had two owners, the control loop and any HTTP goroutine
+> handling an inbound higher-term RPC — and the fixes interlock: F7's
+> `reconcileLeadership` is what makes F8's guard safe to simplify, and F15's
+> term check is meaningless without F7 noticing the stepdown. Splitting them
+> would have shipped three intermediate states that were each incoherent.
+>
+> The F9 test required extending the fake network with `SetBlackholeDelay`: a
+> cut link that fails immediately models a refused connection, which costs the
+> caller nothing and therefore cannot distinguish waiting-for-a-quorum from
+> waiting-for-everyone.
 
 Currently two: the control loop, and any HTTP goroutine that calls
 `BecomeFollower`. These four findings are one bug wearing four hats.
 
-- [ ] **F7 — inbound-RPC stepdown never reconciles the engine.**
+- [x] **F7 — inbound-RPC stepdown never reconciles the engine.** *(done `f0f47e1`)*
       `HandleRequestVote`/`HandleAppendEntries` demote a leader on the HTTP
       goroutine; `stopReplicators()` is only reachable via `handleStepDown`
       (outbound path) or shutdown. Stale replicators survive with the old
@@ -261,7 +273,7 @@ Currently two: the control loop, and any HTTP goroutine that calls
       *Fix:* `if higherTerm <= e.node.CurrentTerm() { return }`.
       *Test:* `TestHandleStepDown_IgnoresStaleTerm`.
 
-- [ ] **F15 — waiters are not term-scoped.**
+- [x] **F15 — waiters are not term-scoped.** *(done `f0f47e1`)*
       ([engine.go:188](../internal/engine/engine.go#L188)) `fireCommittedWaiters`
       resolves on `w.index <= commitIndex` alone. A waiter that survives an
       unnoticed stepdown (F7) and a re-election inside its 2s deadline gets acked
