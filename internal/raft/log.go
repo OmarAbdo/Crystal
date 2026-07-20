@@ -471,21 +471,62 @@ func (rl *RaftLog) ResetToSnapshot(lastIncludedIndex, lastIncludedTerm int) erro
 }
 
 // RestoreOffset seeds the snapshot boundary at startup, when a snapshot exists
-// on disk. It must be called before the cache is consulted. It sets
-// lastIncludedIndex/Term and, if the post-snapshot WAL turned out to be empty
-// (nothing appended after the snapshot), aligns firstIndex/nextIndex to the
-// boundary so the next AppendLeader assigns lastIncludedIndex+1.
-func (rl *RaftLog) RestoreOffset(lastIncludedIndex, lastIncludedTerm int) {
+// on disk, and reconciles whatever the WAL happens to contain against it.
+//
+// The WAL and the snapshot can legitimately disagree, because a snapshot is
+// persisted BEFORE the entries it covers are discarded (see
+// RaftNode.HandleInstallSnapshot). A crash in that window — or in the equivalent
+// window during compaction — leaves a snapshot at index S with the WAL still
+// holding entries at or below S. Recovery has to resolve that, or firstIndex
+// describes entries the log does not have and every index translation after it
+// is wrong.
+//
+// Three cases:
+//
+//   - WAL empty: align the boundary so the next append assigns S+1.
+//   - WAL entirely at or below S: every entry is superseded. Drop them all.
+//   - WAL extends past S: keep the contiguous run starting at S+1 and drop the
+//     rest. A gap after S is not repairable here, so anything beyond it goes too;
+//     the leader will re-ship it.
+//
+// The WAL is rewritten to match, so the next recovery sees the reconciled log
+// rather than repeating this work — or worse, resurrecting the dropped entries.
+func (rl *RaftLog) RestoreOffset(lastIncludedIndex, lastIncludedTerm int) error {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	rl.lastIncludedIndex = lastIncludedIndex
 	rl.lastIncludedTerm = lastIncludedTerm
+	rl.firstIndex = lastIncludedIndex + 1
 
 	if len(rl.cache) == 0 {
-		rl.firstIndex = lastIncludedIndex + 1
 		rl.nextIndex = lastIncludedIndex + 1
+		return nil
 	}
+
+	// Keep only the entries that continue the log contiguously from the snapshot
+	// boundary.
+	kept := make([]LogEntry, 0, len(rl.cache))
+	expected := lastIncludedIndex + 1
+	for _, e := range rl.cache {
+		if e.Index != expected {
+			continue
+		}
+		kept = append(kept, e)
+		expected++
+	}
+
+	dropped := len(rl.cache) - len(kept)
+	rl.cache = kept
+	rl.nextIndex = expected
+
+	if dropped == 0 {
+		return nil
+	}
+
+	log.Printf("[WAL] Snapshot at index %d supersedes %d WAL entries — rewriting",
+		lastIncludedIndex, dropped)
+	return rl.rewriteWALLocked()
 }
 
 // Close flushes and closes the underlying WAL file.

@@ -155,7 +155,12 @@ func restoreFromSnapshot(
 
 	// Re-establish the compaction offset and commit/applied boundaries so the
 	// index math and apply loop are consistent with the compacted WAL.
-	raftLog.RestoreOffset(snap.Meta.LastIncludedIndex, snap.Meta.LastIncludedTerm)
+	// RestoreOffset also reconciles a WAL that overlaps the snapshot, which is a
+	// legitimate on-disk state: snapshots are persisted before the entries they
+	// cover are discarded, so a crash in that window leaves both.
+	if err := raftLog.RestoreOffset(snap.Meta.LastIncludedIndex, snap.Meta.LastIncludedTerm); err != nil {
+		return err
+	}
 	node.SeedFromSnapshot(snap.Meta.LastIncludedIndex)
 
 	return nil

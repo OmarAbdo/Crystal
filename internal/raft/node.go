@@ -349,21 +349,30 @@ func (rn *RaftNode) HandleInstallSnapshot(
 		return InstallSnapshotResponse{Term: currentTerm}
 	}
 
-	// Steps 6–7: reconcile the log against the snapshot boundary.
-	if err := rl.ResetToSnapshot(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
-		log.Printf("[RAFT] InstallSnapshot log reset failed: %v", err)
-		return InstallSnapshotResponse{Term: currentTerm}
-	}
-
-	// Step 5: persist the snapshot durably now that the log agrees with it.
+	// Step 5: persist the snapshot BEFORE anything is discarded on its behalf.
+	//
+	// The log reset below destroys entries this follower has already fsync-acked
+	// to a leader. If we crash between the reset and the persist, those entries
+	// are gone and the state that replaced them was never written — nothing on
+	// disk can reconstruct either. The reverse ordering fails safely: a persisted
+	// snapshot covering entries still present in the log is reconciled on the
+	// next startup by RaftLog.RestoreOffset.
 	if err := persist(); err != nil {
 		log.Printf("[RAFT] InstallSnapshot persist failed: %v", err)
 		return InstallSnapshotResponse{Term: currentTerm}
 	}
 
-	// Advance commit/applied to the snapshot boundary — everything up to here is
-	// durably part of the state machine now.
+	// Raise commit/applied to the boundary BEFORE the log shrinks. The engine's
+	// apply loop runs on another goroutine and halts on a committed entry it
+	// cannot read (see Engine.applyCommitted); shrinking the log first would
+	// expose exactly that state for as long as the two calls are apart.
 	rn.SeedFromSnapshot(req.LastIncludedIndex)
+
+	// Steps 6–7: reconcile the log against the snapshot boundary.
+	if err := rl.ResetToSnapshot(req.LastIncludedIndex, req.LastIncludedTerm); err != nil {
+		log.Printf("[RAFT] InstallSnapshot log reset failed: %v", err)
+		return InstallSnapshotResponse{Term: currentTerm}
+	}
 
 	log.Printf("[RAFT] Installed snapshot through index %d term %d",
 		req.LastIncludedIndex, req.LastIncludedTerm)
