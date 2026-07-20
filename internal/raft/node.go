@@ -56,9 +56,11 @@ type RaftNode struct {
 	NextIndex  map[int]int // peerID → next index to send
 	MatchIndex map[int]int // peerID → highest log index confirmed replicated
 
-	// Persistent state (must survive restarts)
-	persistent     PersistentState
-	metadataPath   string
+	// Persistent state (must survive restarts). It is only ever updated through
+	// commitPersistentLocked, which writes to store BEFORE adopting the value —
+	// see the comment there for why the order matters.
+	persistent PersistentState
+	store      stateStore
 }
 
 // NewRaftNode creates a node, loading persistent state from disk if it exists.
@@ -76,7 +78,7 @@ func NewRaftNode(nodeID int, peerIDs []int, clusterSize int, metadataPath string
 		lastContact:  time.Now(),
 		NextIndex:    make(map[int]int),
 		MatchIndex:   make(map[int]int),
-		metadataPath: metadataPath,
+		store:        fileStateStore{path: metadataPath},
 		persistent: PersistentState{
 			CurrentTerm: 0, // first boot; first election bumps to 1 (Figure 2)
 			VotedFor:    -1,
@@ -408,16 +410,23 @@ func (rn *RaftNode) BecomeCandidate() (term int, err error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	// Record the new term and self-vote on stable storage BEFORE adopting them.
+	// Adopting first would let a persist failure leave the node campaigning in a
+	// term it cannot prove it entered: after a crash it would return at the old
+	// term with no vote recorded and could vote for someone else in the term it
+	// had already spent on itself.
+	next := PersistentState{
+		CurrentTerm: rn.persistent.CurrentTerm + 1,
+		VotedFor:    rn.nodeID,
+	}
+	if err := rn.commitPersistentLocked(next); err != nil {
+		return 0, fmt.Errorf("persist candidate state: %w", err)
+	}
+
 	rn.Role = Candidate
-	rn.persistent.CurrentTerm++
-	rn.persistent.VotedFor = rn.nodeID
 	rn.LeaderID = 0
 	rn.votesGranted = 1 // vote for self
 	rn.lastContact = time.Now()
-
-	if err := rn.savePersistentStateLocked(); err != nil {
-		return 0, err
-	}
 
 	log.Printf("[RAFT] Node %d starting election for term %d", rn.nodeID, rn.persistent.CurrentTerm)
 	return rn.persistent.CurrentTerm, nil
@@ -450,35 +459,45 @@ func (rn *RaftNode) HandleRequestVote(req RequestVoteRequest, myLastIndex, myLas
 		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
 	}
 
+	// Decide everything against a candidate copy of the persistent state, and
+	// adopt it only once it is durable. Nothing below mutates rn.persistent
+	// directly.
+	next := rn.persistent
+
 	// A newer term means we must step down and clear our old vote before we can
 	// consider granting one in the new term (§5.1, "All Servers" rule).
-	if req.Term > rn.persistent.CurrentTerm {
-		rn.persistent.CurrentTerm = req.Term
-		rn.persistent.VotedFor = -1
-		rn.Role = Follower
-		rn.LeaderID = 0
+	steppedUp := req.Term > next.CurrentTerm
+	if steppedUp {
+		next.CurrentTerm = req.Term
+		next.VotedFor = -1
 	}
 
 	// Step 2: grant the vote iff we haven't voted for anyone else this term AND
 	// the candidate's log is at least as up-to-date as ours (§5.4.1).
-	alreadyVoted := rn.persistent.VotedFor != -1 && rn.persistent.VotedFor != req.CandidateID
+	alreadyVoted := next.VotedFor != -1 && next.VotedFor != req.CandidateID
 	upToDate := candidateUpToDate(req.LastLogTerm, req.LastLogIndex, myLastTerm, myLastIndex)
+	grant := !alreadyVoted && upToDate
+	if grant {
+		next.VotedFor = req.CandidateID
+	}
 
-	if alreadyVoted || !upToDate {
-		// Persist any term bump from above before replying.
-		if err := rn.savePersistentStateLocked(); err != nil {
-			log.Printf("[RAFT] persist during vote-deny failed: %v", err)
-		}
+	// If the write fails we have promised nothing and changed nothing: report our
+	// durable term (NOT the term we failed to record — the candidate would read
+	// that as proof we stepped up) and deny.
+	if err := rn.commitPersistentLocked(next); err != nil {
+		log.Printf("[RAFT] persist during vote decision failed: %v", err)
 		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
 	}
 
-	rn.persistent.VotedFor = req.CandidateID
+	if steppedUp {
+		rn.Role = Follower
+		rn.LeaderID = 0
+	}
+	if !grant {
+		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
+	}
+
 	rn.lastContact = time.Now() // granting a vote resets our election timer
-	if err := rn.savePersistentStateLocked(); err != nil {
-		log.Printf("[RAFT] persist during vote-grant failed: %v", err)
-		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
-	}
-
 	log.Printf("[RAFT] Node %d granted vote to %d for term %d", rn.nodeID, req.CandidateID, req.Term)
 	return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: true}
 }
@@ -558,14 +577,24 @@ func (rn *RaftNode) BecomeFollower(term, leaderID int) error {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.Role = Follower
-	rn.LeaderID = leaderID
-	if term > rn.persistent.CurrentTerm {
-		rn.persistent.CurrentTerm = term
-		rn.persistent.VotedFor = -1
+	next := rn.persistent
+	if term > next.CurrentTerm {
+		next.CurrentTerm = term
+		next.VotedFor = -1
 	}
 
-	return rn.savePersistentStateLocked()
+	// Persist the term bump before acting on it. On failure the node keeps its
+	// old term and role rather than stepping down into a term it cannot prove it
+	// reached. A same-term stepdown changes nothing persistent, so
+	// commitPersistentLocked skips the write and this cannot fail — a leader
+	// yielding to a same-term leader must never be blocked by a broken disk.
+	if err := rn.commitPersistentLocked(next); err != nil {
+		return fmt.Errorf("persist follower state: %w", err)
+	}
+
+	rn.Role = Follower
+	rn.LeaderID = leaderID
+	return nil
 }
 
 // BecomeLeader promotes the node to leader after winning an election. It is
@@ -600,19 +629,68 @@ func (rn *RaftNode) BecomeLeader(electionTerm, lastLogIndex int) (promoted bool)
 
 // ---- Persistent state management ----
 
-func (rn *RaftNode) loadPersistentState() error {
-	data, err := os.ReadFile(rn.metadataPath)
+// stateStore is the durability seam for Raft's Figure 2 persistent state. It
+// exists so the node's transitions can be tested against a failing disk: every
+// one of them must leave in-memory state untouched when Save fails, and that
+// property is invisible to a test that can only ever succeed.
+type stateStore interface {
+	// Load returns the stored state. ok is false when nothing has been stored
+	// yet (first boot), in which case the caller keeps its defaults.
+	Load() (state PersistentState, ok bool, err error)
+
+	// Save durably records state. It must not return nil until the write has
+	// reached stable storage.
+	Save(state PersistentState) error
+}
+
+// fileStateStore keeps the state as a small JSON document. It is separate from
+// the WAL because the WAL is append-only and this record needs in-place update.
+type fileStateStore struct {
+	path string
+}
+
+func (f fileStateStore) Load() (PersistentState, bool, error) {
+	data, err := os.ReadFile(f.path)
 	if os.IsNotExist(err) {
-		// First boot: defaults already set in constructor.
-		return rn.savePersistentState()
+		return PersistentState{}, false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read raft metadata: %w", err)
+		return PersistentState{}, false, fmt.Errorf("read raft metadata: %w", err)
 	}
 
 	var ps PersistentState
 	if err := json.Unmarshal(data, &ps); err != nil {
-		return fmt.Errorf("parse raft metadata: %w", err)
+		return PersistentState{}, false, fmt.Errorf("parse raft metadata: %w", err)
+	}
+	return ps, true, nil
+}
+
+// Save writes term+votedFor durably, not merely atomically. Figure 2 requires
+// this record to be on stable storage before the node responds to an RPC; if it
+// is only in the page cache, a power cut resurrects the node in a term it has
+// already voted in, it votes a second time, and two leaders are elected for that
+// term. WriteFileAtomic fsyncs both the file and its directory, so the record —
+// and the rename that publishes it — actually survive.
+func (f fileStateStore) Save(state PersistentState) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	if err := fsutil.WriteFileAtomic(f.path, data, 0666); err != nil {
+		return fmt.Errorf("persist raft metadata: %w", err)
+	}
+	return nil
+}
+
+func (rn *RaftNode) loadPersistentState() error {
+	ps, ok, err := rn.store.Load()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// First boot: write the constructor defaults so the file exists and the
+		// node's durable term is unambiguous from here on.
+		return rn.store.Save(rn.persistent)
 	}
 
 	rn.persistent = ps
@@ -620,28 +698,22 @@ func (rn *RaftNode) loadPersistentState() error {
 	return nil
 }
 
-func (rn *RaftNode) savePersistentState() error {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-	return rn.savePersistentStateLocked()
-}
-
-// savePersistentStateLocked writes term+votedFor to disk.
-// Caller must hold rn.mu (write).
+// commitPersistentLocked durably records next and, only on success, adopts it as
+// the node's in-memory state. This ordering is the whole point: adopting first
+// and persisting second leaves the node acting on a term it may not be able to
+// prove it reached.
 //
-// This write must be DURABLE, not merely atomic. Figure 2 requires currentTerm
-// and votedFor to be on stable storage before the node responds to an RPC; if
-// the record is only in the page cache, a power cut resurrects the node in a
-// term it has already voted in, it votes a second time, and two leaders are
-// elected for that term. fsutil.WriteFileAtomic fsyncs both the file and its
-// directory so the record — and the rename that publishes it — actually survive.
-func (rn *RaftNode) savePersistentStateLocked() error {
-	data, err := json.Marshal(rn.persistent)
-	if err != nil {
+// A no-op change skips the write entirely, so transitions that alter no
+// persistent state (a same-term stepdown) cannot be blocked by a broken disk.
+//
+// Caller must hold rn.mu (write).
+func (rn *RaftNode) commitPersistentLocked(next PersistentState) error {
+	if next == rn.persistent {
+		return nil
+	}
+	if err := rn.store.Save(next); err != nil {
 		return err
 	}
-	if err := fsutil.WriteFileAtomic(rn.metadataPath, data, 0666); err != nil {
-		return fmt.Errorf("persist raft metadata: %w", err)
-	}
+	rn.persistent = next
 	return nil
 }

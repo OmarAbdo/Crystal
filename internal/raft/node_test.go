@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -356,5 +357,129 @@ func TestPersistentStateSurvivesReload(t *testing.T) {
 	}
 	if rn2.persistent.VotedFor != 3 {
 		t.Fatalf("reloaded votedFor = %d, want 3", rn2.persistent.VotedFor)
+	}
+}
+
+// ---- F3: persist before mutate ----
+//
+// Figure 2's stable-storage rule is only meaningful if the in-memory state never
+// runs ahead of the disk. A node that has incremented its term and voted for
+// itself in memory, but failed to write that down, will come back after a crash
+// believing it never participated in that term — and can vote a second time in
+// it. So every one of these transitions must persist FIRST and adopt the new
+// state only on success.
+
+// failingStore is a stateStore whose Save always fails, standing in for a full
+// disk, a permissions error, or an I/O fault.
+type failingStore struct {
+	loaded PersistentState
+	saves  int
+}
+
+func (f *failingStore) Load() (PersistentState, bool, error) { return f.loaded, true, nil }
+
+func (f *failingStore) Save(PersistentState) error {
+	f.saves++
+	return errors.New("simulated persist failure")
+}
+
+// newFailingNode returns a node whose persistence is broken, seeded with a known
+// starting state.
+func newFailingNode(t *testing.T, seed PersistentState) (*RaftNode, *failingStore) {
+	t.Helper()
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+	fs := &failingStore{loaded: seed}
+	rn.persistent = seed
+	rn.store = fs
+	return rn, fs
+}
+
+func TestBecomeCandidate_PersistFailureLeavesStateUnchanged(t *testing.T) {
+	rn, fs := newFailingNode(t, PersistentState{CurrentTerm: 4, VotedFor: -1})
+
+	term, err := rn.BecomeCandidate()
+	if err == nil {
+		t.Fatal("BecomeCandidate succeeded despite persist failure, want error")
+	}
+	if term != 0 {
+		t.Fatalf("term = %d, want 0 on failure", term)
+	}
+	if fs.saves != 1 {
+		t.Fatalf("Save called %d times, want 1", fs.saves)
+	}
+
+	// The node must not believe it is a candidate in term 5 having voted for
+	// itself — none of that reached disk.
+	if rn.persistent.CurrentTerm != 4 {
+		t.Fatalf("CurrentTerm = %d, want 4 (unchanged)", rn.persistent.CurrentTerm)
+	}
+	if rn.persistent.VotedFor != -1 {
+		t.Fatalf("VotedFor = %d, want -1 (unchanged)", rn.persistent.VotedFor)
+	}
+	if rn.Role != Follower {
+		t.Fatalf("Role = %s, want Follower (unchanged)", rn.Role)
+	}
+}
+
+func TestHandleRequestVote_PersistFailureDoesNotRecordVote(t *testing.T) {
+	rn, _ := newFailingNode(t, PersistentState{CurrentTerm: 4, VotedFor: -1})
+
+	resp := rn.HandleRequestVote(RequestVoteRequest{
+		Term: 9, CandidateID: 2, LastLogIndex: 0, LastLogTerm: 0,
+	}, 0, 0)
+
+	if resp.VoteGranted {
+		t.Fatal("vote granted despite persist failure")
+	}
+	// We must also not advertise the higher term we could not record: the
+	// candidate would treat that as proof we stepped up.
+	if resp.Term != 4 {
+		t.Fatalf("resp.Term = %d, want 4 (our durable term)", resp.Term)
+	}
+	if rn.persistent.CurrentTerm != 4 {
+		t.Fatalf("CurrentTerm = %d, want 4 (unchanged)", rn.persistent.CurrentTerm)
+	}
+	if rn.persistent.VotedFor != -1 {
+		t.Fatalf("VotedFor = %d, want -1 (no vote recorded)", rn.persistent.VotedFor)
+	}
+}
+
+func TestBecomeFollower_PersistFailureLeavesTermUnchanged(t *testing.T) {
+	rn, _ := newFailingNode(t, PersistentState{CurrentTerm: 4, VotedFor: 3})
+	rn.Role = Leader
+
+	if err := rn.BecomeFollower(9, 2); err == nil {
+		t.Fatal("BecomeFollower succeeded despite persist failure, want error")
+	}
+
+	if rn.persistent.CurrentTerm != 4 {
+		t.Fatalf("CurrentTerm = %d, want 4 (unchanged)", rn.persistent.CurrentTerm)
+	}
+	if rn.persistent.VotedFor != 3 {
+		t.Fatalf("VotedFor = %d, want 3 (unchanged)", rn.persistent.VotedFor)
+	}
+}
+
+// Stepping down at the SAME term changes no persistent state, so it must not be
+// blocked by a broken disk — a leader that learns of a same-term leader has to
+// be able to yield regardless.
+func TestBecomeFollower_SameTermSucceedsWithoutPersist(t *testing.T) {
+	rn, fs := newFailingNode(t, PersistentState{CurrentTerm: 4, VotedFor: 3})
+	rn.Role = Candidate
+
+	if err := rn.BecomeFollower(4, 2); err != nil {
+		t.Fatalf("BecomeFollower at same term: %v", err)
+	}
+	if fs.saves != 0 {
+		t.Fatalf("Save called %d times, want 0 (nothing changed)", fs.saves)
+	}
+	if rn.Role != Follower {
+		t.Fatalf("Role = %s, want Follower", rn.Role)
+	}
+	if rn.LeaderID != 2 {
+		t.Fatalf("LeaderID = %d, want 2", rn.LeaderID)
+	}
+	if rn.persistent.VotedFor != 3 {
+		t.Fatalf("VotedFor = %d, want 3 preserved", rn.persistent.VotedFor)
 	}
 }
