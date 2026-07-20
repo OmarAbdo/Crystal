@@ -19,18 +19,30 @@ import (
 
 const writeTimeout = 2 * time.Second
 
+// leaderHintHeader carries the leader's address on a redirect, so a client can
+// follow it without parsing prose.
+const leaderHintHeader = "X-Raft-Leader"
+
 // Server holds the dependencies injected into HTTP handlers.
 type Server struct {
 	node         leaderChecker
 	proposals    chan<- engine.Proposal
 	stateMachine store.StateMachine
 	rpc          rpcHandler
+
+	// peers maps node ID → address, used to turn the leader ID this node knows
+	// into something the client can actually connect to.
+	peers map[int]string
 }
 
 // leaderChecker is the subset of RaftNode the client-facing handlers need.
 type leaderChecker interface {
 	IsLeader() bool
 	NodeID() int
+
+	// CurrentLeader returns the ID of the leader this node last heard from, or 0
+	// when none is known.
+	CurrentLeader() int
 }
 
 // rpcHandler owns the full AppendEntries and RequestVote receiver logic (term
@@ -49,12 +61,14 @@ func NewServer(
 	proposals chan<- engine.Proposal,
 	sm store.StateMachine,
 	rpc rpcHandler,
+	peers map[int]string,
 ) *Server {
 	return &Server{
 		node:         node,
 		proposals:    proposals,
 		stateMachine: sm,
 		rpc:          rpc,
+		peers:        peers,
 	}
 }
 
@@ -82,9 +96,7 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.node.IsLeader() {
-		http.Error(w,
-			fmt.Sprintf("not the leader; route to node %d", s.node.NodeID()),
-			http.StatusMisdirectedRequest)
+		s.redirectToLeader(w)
 		return
 	}
 
@@ -113,9 +125,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.node.IsLeader() {
-		http.Error(w,
-			fmt.Sprintf("not the leader; route to node %d", s.node.NodeID()),
-			http.StatusMisdirectedRequest)
+		s.redirectToLeader(w)
 		return
 	}
 
@@ -223,6 +233,41 @@ func (s *Server) handleInternalSnapshot(w http.ResponseWriter, r *http.Request) 
 
 // ---- Shared helpers ----
 
+// redirectToLeader rejects a write with 421 and tells the client where the
+// leader actually is.
+//
+// §8: "that server will reject the client's request and supply information about
+// the most recent leader it has heard from." This used to name s.node.NodeID() —
+// the node doing the rejecting — which tells the client nothing it did not
+// already know and leaves it rediscovering the leader by guessing.
+//
+// 421 Misdirected Request is the accurate status: the request was well formed and
+// the client is authorized, it simply arrived at a server that cannot serve it.
+//
+// A leader we know by ID but not by address is still worth naming: the client may
+// have routing information this node does not.
+func (s *Server) redirectToLeader(w http.ResponseWriter) {
+	leaderID := s.node.CurrentLeader()
+	if leaderID == 0 {
+		// Genuinely leaderless — between a failure and the next election. Saying
+		// so beats naming a node we know is wrong.
+		http.Error(w, "not the leader; no known leader, retry shortly",
+			http.StatusMisdirectedRequest)
+		return
+	}
+
+	addr, known := s.peers[leaderID]
+	if !known {
+		http.Error(w, fmt.Sprintf("not the leader; leader is node %d", leaderID),
+			http.StatusMisdirectedRequest)
+		return
+	}
+
+	w.Header().Set(leaderHintHeader, addr)
+	http.Error(w, fmt.Sprintf("not the leader; leader is node %d at %s", leaderID, addr),
+		http.StatusMisdirectedRequest)
+}
+
 // submitAndRespond sends a command to the engine and writes the HTTP response.
 func (s *Server) submitAndRespond(w http.ResponseWriter, cmd raft.Command) {
 	resultCh := make(chan error, 1)
@@ -242,7 +287,11 @@ func (s *Server) submitAndRespond(w http.ResponseWriter, cmd raft.Command) {
 			return
 		}
 		if errors.Is(err, engine.ErrNotLeader) {
-			http.Error(w, err.Error(), http.StatusMisdirectedRequest)
+			// We were leader when the proposal was accepted and were deposed
+			// before it committed. The client needs the same redirect it would
+			// have got had it arrived a moment later — including the hint, since
+			// by now we usually know who replaced us.
+			s.redirectToLeader(w)
 			return
 		}
 		if errors.Is(err, engine.ErrCommitTimeout) {

@@ -149,6 +149,19 @@ func (rn *RaftNode) NodeID() int {
 	return rn.nodeID
 }
 
+// CurrentLeader returns the ID of the leader this node last heard from, or 0 if
+// none is known (between a leader's failure and the next election).
+//
+// It is a hint, not a guarantee: the value is only as fresh as the last
+// AppendEntries this node received, and the named leader may already have been
+// deposed. Clients use it to avoid rediscovering the leader by guessing, and must
+// still be prepared to be redirected again.
+func (rn *RaftNode) CurrentLeader() int {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return rn.LeaderID
+}
+
 // ---- Mutation methods ----
 
 // UpdatePeerProgress records that peerID has replicated up to matchIndex.

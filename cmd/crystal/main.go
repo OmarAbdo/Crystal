@@ -68,7 +68,7 @@ func main() {
 	// ---- Build and start the HTTP server ----
 	// The engine is the inbound RPC facade: it already owns the node, log, state
 	// machine and snapshot store, so the HTTP layer never has to know about them.
-	srv := transport.NewServer(node, eng.ProposalQueue(), stateMachine, eng)
+	srv := transport.NewServer(node, eng.ProposalQueue(), stateMachine, eng, cfg.Peers)
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 

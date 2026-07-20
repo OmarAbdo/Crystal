@@ -2,8 +2,10 @@ package engine
 
 import "errors"
 
-// ErrNotLeader is returned when a proposal is submitted to a non-leader node.
-// The HTTP handler translates this into a 403 with the current leader ID.
+// ErrNotLeader is returned when a proposal is submitted to a non-leader node, or
+// when a pending proposal is abandoned because this node stopped being leader.
+// The HTTP handler translates it into 421 Misdirected Request, with the leader's
+// address in X-Raft-Leader when one is known.
 var ErrNotLeader = errors.New("not the leader")
 
 // ErrCommitTimeout is returned when quorum was not reached within the deadline.
