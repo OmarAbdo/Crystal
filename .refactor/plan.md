@@ -194,7 +194,13 @@ Everything after this point is concurrency and partition behavior. Unit tests
 cannot demonstrate the bugs, so the harness comes before the restructure it is
 meant to validate. Build it fresh; do not lift it from the stash.
 
-- [ ] **F18 — in-process cluster harness.** New `internal/testcluster`:
+- [x] **F18 — in-process cluster harness.** *(done `f11cb7d`; `Transport` seam
+      `f223e13`, engine RPC facade `01ccfbe`)* — `internal/testcluster` with
+      directed cuts on both legs, seeded drops, delays; 6 tests in 6.8s vs 48s for
+      the process suite; `CheckSingleLeaderPerTerm` sampled in every poll. Surfaced
+      **F19** (below).
+- [x] **F18b — CI.** *(done `b4e1033`)* — ubuntu, `-race` on everything, harness
+      repeated `-count=3`. Also untracked the committed WAL/meta (M6). New `internal/testcluster`:
       real `Engine`/`RaftNode`/`RaftLog` instances wired over an injectable
       transport with directed link cuts (request *and* response legs), seeded
       drops, and delays. Helpers: `SetViaLeader`, `WaitConverged`,
@@ -207,10 +213,22 @@ meant to validate. Build it fresh; do not lift it from the stash.
       its own commit, landed first, with no behavior change.
       *Test:* `TestHarness_ElectsSingleLeader`, `TestHarness_PartitionHealsData`.
 
-- [ ] **F18b — CI.** GitHub Actions on ubuntu (so `-race` actually runs; it
-      can't on the Windows box — no cgo): `go vet`, `-race` unit tests, `-race`
-      integration tests. Race detection is the only thing that will reliably
-      catch regressions of F1.
+- [ ] **F19 — a leader that loses its quorum never steps down.** *(found
+      2026-07-21 while writing the F18 minority test; not in the original review
+      as a separate item)* Quorum counting is correct — no minority node ever wins
+      an election — but the incumbent keeps `Role == Leader` indefinitely after
+      being cut off. Not a Figure 2 violation (a stale leader cannot commit), but
+      two things downstream assume a node claiming leadership can reach a quorum:
+      `/get` serves local state (**F12**) so a deposed leader answers with
+      arbitrarily stale data, and clients are redirected to it (**F10**) only to
+      hang until the proposal deadline.
+      *Fix:* CheckQuorum — the leader tracks per-peer ack recency and steps down
+      when a majority has not been heard from within an election timeout. This is
+      the same machinery ReadIndex needs in F12, so **build it once, in F12, and
+      have F19 fall out of it.**
+      *Test:* `TestPartitionedLeaderStepsDown`, currently `t.Skip`ped in
+      `internal/testcluster/cluster_test.go` with the reason inline — unskip it
+      when the mechanism lands.
 
 ---
 
