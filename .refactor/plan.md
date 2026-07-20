@@ -87,7 +87,17 @@ are what stand between a power cut and a silently divergent cluster.
 The RPC receivers currently make their Figure 2 decisions across several
 independent lock acquisitions. This phase makes each receiver decide once.
 
-- [ ] **F1 — `HandleAppendEntries` term TOCTOU.**
+- [x] **F1 — `HandleAppendEntries` term TOCTOU.** *(done `6912774`, includes F1b)*
+      — both receivers hold `rn.mu` across the log work; `*Locked` variants added
+      for `BecomeFollower`/`SetFollowerCommitIndex`/`SeedFromSnapshot`;
+      `termDecisionHook` makes the race deterministic. **Note:** a follower now
+      holds `rn.mu` across the WAL fsync — M5 (batch fsyncs) is the relief valve.
+- [x] **F1c — vote decision sampled log state outside its critical section.**
+      *(done `38458d0`)* — found while auditing lock-order call sites, not in the
+      original review. `RaftLog.LastLogState` returns index+term under one
+      acquisition (they could tear); `HandleRequestVote` takes the reader as a
+      callback and invokes it under `rn.mu`, so a concurrent append can't make the
+      §5.4.1 comparison stale between sample and decision. 2 tests.
       ([node.go:242](../internal/raft/node.go#L242)) Reads `currentTerm`, releases,
       reads `State()`, releases, calls `BecomeFollower`, releases, then splices
       the log with no node lock held. Two concurrent HTTP goroutines carrying
@@ -101,11 +111,14 @@ independent lock acquisitions. This phase makes each receiver decide once.
       goroutines, `-race`, assert the lower-term append is not applied).
       *Blast radius:* the hottest path in the system. Do not combine with F17.
 
-- [ ] **F1b — `HandleInstallSnapshot` has the identical structure.**
-      ([node.go:308](../internal/raft/node.go#L308)) Same fix, separate commit.
-      *Test:* `TestHandleInstallSnapshot_ConcurrentTermsRejectStale`.
+- [x] **F1b — `HandleInstallSnapshot` has the identical structure.** *(done
+      `6912774`, folded into F1 — the two receivers share the `*Locked` helpers,
+      so splitting them across commits would have left the tree uncompilable.)*
 
-- [ ] **F11 — lock discipline is documented as a lie.** The node.go header says
+- [x] **F11 — lock discipline is documented as a lie.** *(done `d2081b0`)* —
+      header now states the order `rn.mu → rl.mu` and records that it is safe by
+      construction (`RaftLog` holds no reference to `RaftNode`; verified by grep).
+      Doc-only, landed before F1 as planned. The node.go header says
       `RaftNode.mu` and `RaftLog.mu` are "NEVER held simultaneously";
       `AdvanceCommitIndex` ([node.go:217](../internal/raft/node.go#L217)) calls
       `termAt(quorumIndex)` — which takes `rl.mu` — while holding `rn.mu`. No
