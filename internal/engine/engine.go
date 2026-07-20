@@ -43,6 +43,11 @@ const (
 	electionTimeoutMin = 300 * time.Millisecond
 	electionTimeoutMax = 600 * time.Millisecond
 	heartbeatInterval  = 100 * time.Millisecond
+
+	// replicationTimeout bounds a single outbound RPC. It is a liveness knob, not
+	// a safety one: a leader that blocks forever on a black-holed peer stops
+	// making progress for every other peer too.
+	replicationTimeout = 1 * time.Second
 )
 
 // Proposal is a client write request flowing through the engine.
@@ -89,7 +94,7 @@ type Engine struct {
 	fatalf func(format string, args ...any)
 }
 
-// New creates an Engine. The proposals channel is exposed via ProposalQueue().
+// New creates an Engine using the production HTTP transport.
 func New(
 	cfg *config.Config,
 	node *raft.RaftNode,
@@ -97,12 +102,27 @@ func New(
 	sm store.StateMachine,
 	snapshots *store.SnapshotManager,
 ) *Engine {
+	return NewWithTransport(cfg, node, raftLog, sm, snapshots,
+		raft.NewHTTPTransport(replicationTimeout))
+}
+
+// NewWithTransport creates an Engine over an arbitrary transport. Tests use it
+// to run a whole cluster in one process over a fake network, where links can be
+// cut in one direction at a chosen moment.
+func NewWithTransport(
+	cfg *config.Config,
+	node *raft.RaftNode,
+	raftLog *raft.RaftLog,
+	sm store.StateMachine,
+	snapshots *store.SnapshotManager,
+	transport raft.Transport,
+) *Engine {
 	e := &Engine{
 		node:         node,
 		raftLog:      raftLog,
 		stateMachine: sm,
 		snapshots:    snapshots,
-		replicator:   raft.NewReplicator(),
+		replicator:   raft.NewReplicator(transport),
 		peers:        cfg.Peers,
 		proposals:    make(chan Proposal, 100),
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano() + int64(node.NodeID()))),

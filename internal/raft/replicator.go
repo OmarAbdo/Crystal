@@ -1,36 +1,27 @@
 package raft
 
-// Replicator handles outbound AppendEntries RPCs to peer nodes.
-// It is stateless: all state lives in RaftNode and RaftLog.
-// Each call to ReplicateTo fires a single HTTP POST carrying the entries
-// from the peer's nextIndex onward, then advances matchIndex/nextIndex on
-// success or backtracks nextIndex on a log-inconsistency rejection.
+// Replicator is the leader's outbound half of §5.3. It is stateless: all state
+// lives in RaftNode and RaftLog, and every call is one RPC round to one peer.
 //
-// Future: replace HTTP with a persistent gRPC stream per peer,
-// add retry with backoff, implement InstallSnapshot RPC for
-// catching up peers that have fallen too far behind the log.
+// It owns no goroutines and no scheduling. When and how often to replicate is
+// the engine's decision (one long-lived goroutine per peer); what to send and
+// how to interpret the answer is this file's.
+//
+// All network access goes through a Transport, so a test can substitute a fake
+// network and provoke the partitions that make Raft interesting.
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
 	stdlog "log"
-	"net/http"
-	"time"
 )
 
-const replicationTimeout = 1 * time.Second
-
-// Replicator sends log entries to peer nodes.
+// Replicator sends log entries and snapshots to peer nodes.
 type Replicator struct {
-	client *http.Client
+	transport Transport
 }
 
-// NewReplicator creates a Replicator with a bounded HTTP client.
-func NewReplicator() *Replicator {
-	return &Replicator{
-		client: &http.Client{Timeout: replicationTimeout},
-	}
+// NewReplicator creates a Replicator that sends over the given transport.
+func NewReplicator(transport Transport) *Replicator {
+	return &Replicator{transport: transport}
 }
 
 // ReplicateTo sends one AppendEntries RPC to the peer at addr, carrying every
@@ -63,17 +54,16 @@ func (r *Replicator) ReplicateTo(node *RaftNode, log *RaftLog, peerID int, addr 
 
 	entries := log.GetEntriesFrom(nextIndex)
 
-	req := AppendEntriesRequest{
+	result, err := r.transport.AppendEntries(addr, AppendEntriesRequest{
 		Term:         term,
 		LeaderID:     node.NodeID(),
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: commitIndex,
-	}
-
-	result, ok := r.send(peerID, addr, req)
-	if !ok {
+	})
+	if err != nil {
+		stdlog.Printf("[REPLICATOR] Peer %d (%s) append failed: %v", peerID, addr, err)
 		return 0
 	}
 
@@ -92,67 +82,16 @@ func (r *Replicator) ReplicateTo(node *RaftNode, log *RaftLog, peerID int, addr 
 	return result.Term
 }
 
-// send marshals and POSTs a single AppendEntries request, returning the decoded
-// response. ok is false if the peer was unreachable or returned a bad response.
-func (r *Replicator) send(peerID int, addr string, req AppendEntriesRequest) (AppendEntriesResponse, bool) {
-	payload, err := json.Marshal(req)
-	if err != nil {
-		stdlog.Printf("[REPLICATOR] Failed to marshal request for peer %d: %v", peerID, err)
-		return AppendEntriesResponse{}, false
-	}
-
-	url := fmt.Sprintf("http://%s/internal/append", addr)
-	resp, err := r.client.Post(url, "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		stdlog.Printf("[REPLICATOR] Peer %d (%s) unreachable: %v", peerID, addr, err)
-		return AppendEntriesResponse{}, false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		stdlog.Printf("[REPLICATOR] Peer %d rejected append: HTTP %d", peerID, resp.StatusCode)
-		return AppendEntriesResponse{}, false
-	}
-
-	var result AppendEntriesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		stdlog.Printf("[REPLICATOR] Peer %d returned unparseable response: %v", peerID, err)
-		return AppendEntriesResponse{}, false
-	}
-
-	return result, true
-}
-
 // RequestVoteFrom sends a single RequestVote RPC to the peer at addr and returns
 // the decoded response. ok is false if the peer was unreachable or replied
 // badly. The engine tallies votes and detects term-stepdown from the responses.
 func (r *Replicator) RequestVoteFrom(peerID int, addr string, req RequestVoteRequest) (RequestVoteResponse, bool) {
-	payload, err := json.Marshal(req)
+	resp, err := r.transport.RequestVote(addr, req)
 	if err != nil {
-		stdlog.Printf("[REPLICATOR] Failed to marshal vote request for peer %d: %v", peerID, err)
+		stdlog.Printf("[REPLICATOR] Peer %d (%s) vote request failed: %v", peerID, addr, err)
 		return RequestVoteResponse{}, false
 	}
-
-	url := fmt.Sprintf("http://%s/internal/vote", addr)
-	resp, err := r.client.Post(url, "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		stdlog.Printf("[REPLICATOR] Peer %d (%s) unreachable for vote: %v", peerID, addr, err)
-		return RequestVoteResponse{}, false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		stdlog.Printf("[REPLICATOR] Peer %d rejected vote request: HTTP %d", peerID, resp.StatusCode)
-		return RequestVoteResponse{}, false
-	}
-
-	var result RequestVoteResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		stdlog.Printf("[REPLICATOR] Peer %d returned unparseable vote response: %v", peerID, err)
-		return RequestVoteResponse{}, false
-	}
-
-	return result, true
+	return resp, true
 }
 
 // InstallSnapshotTo ships a full snapshot to a follower that has fallen behind
@@ -163,28 +102,9 @@ func (r *Replicator) RequestVoteFrom(peerID int, addr string, req RequestVoteReq
 func (r *Replicator) InstallSnapshotTo(node *RaftNode, peerID int, addr string, req InstallSnapshotRequest) int {
 	_, term := node.State()
 
-	payload, err := json.Marshal(req)
+	result, err := r.transport.InstallSnapshot(addr, req)
 	if err != nil {
-		stdlog.Printf("[REPLICATOR] Failed to marshal snapshot for peer %d: %v", peerID, err)
-		return 0
-	}
-
-	url := fmt.Sprintf("http://%s/internal/snapshot", addr)
-	resp, err := r.client.Post(url, "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		stdlog.Printf("[REPLICATOR] Peer %d (%s) unreachable for snapshot: %v", peerID, addr, err)
-		return 0
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		stdlog.Printf("[REPLICATOR] Peer %d rejected snapshot: HTTP %d", peerID, resp.StatusCode)
-		return 0
-	}
-
-	var result InstallSnapshotResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		stdlog.Printf("[REPLICATOR] Peer %d returned unparseable snapshot response: %v", peerID, err)
+		stdlog.Printf("[REPLICATOR] Peer %d (%s) snapshot failed: %v", peerID, addr, err)
 		return 0
 	}
 
