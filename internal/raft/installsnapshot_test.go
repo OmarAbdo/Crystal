@@ -187,3 +187,146 @@ func TestRestoreOffset_EmptyLogAlignsToBoundary(t *testing.T) {
 		t.Fatalf("next appended index = %d, want 51", entry.Index)
 	}
 }
+
+// ---- F4: a failed install must not count as replication ----
+
+// recordingTransport captures the last InstallSnapshot response it returned.
+type recordingTransport struct {
+	Transport
+	resp InstallSnapshotResponse
+}
+
+func (r *recordingTransport) InstallSnapshot(string, InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return r.resp, nil
+}
+
+// The leader advances a peer's matchIndex on the strength of an InstallSnapshot
+// reply. If every failure path returns the same bytes as success, it advances on
+// failures too — and matchIndex is what AdvanceCommitIndex counts. A follower
+// that failed to restore is then indistinguishable from one holding the data, so
+// a phantom quorum commits entries that exist on one server. Kill that server and
+// the committed entries are gone: Leader Completeness violated by bookkeeping.
+func TestInstallSnapshotTo_NoProgressOnFailure(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+	if err := rn.BecomeFollower(4, 0); err != nil {
+		t.Fatalf("seed term: %v", err)
+	}
+
+	tr := &recordingTransport{resp: InstallSnapshotResponse{Term: 4, Success: false}}
+	r := NewReplicator(tr)
+
+	r.InstallSnapshotTo(rn, 2, "peer-2", InstallSnapshotRequest{
+		Term: 4, LeaderID: 1, LastIncludedIndex: 50, LastIncludedTerm: 4,
+	})
+
+	rn.mu.RLock()
+	match := rn.MatchIndex[2]
+	rn.mu.RUnlock()
+	if match != 0 {
+		t.Fatalf("MatchIndex[2] = %d after a FAILED install, want 0 — the leader is "+
+			"counting a follower that does not have the data", match)
+	}
+}
+
+func TestInstallSnapshotTo_AdvancesOnSuccess(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+	if err := rn.BecomeFollower(4, 0); err != nil {
+		t.Fatalf("seed term: %v", err)
+	}
+
+	tr := &recordingTransport{resp: InstallSnapshotResponse{Term: 4, Success: true}}
+	r := NewReplicator(tr)
+
+	r.InstallSnapshotTo(rn, 2, "peer-2", InstallSnapshotRequest{
+		Term: 4, LeaderID: 1, LastIncludedIndex: 50, LastIncludedTerm: 4,
+	})
+
+	rn.mu.RLock()
+	match := rn.MatchIndex[2]
+	rn.mu.RUnlock()
+	if match != 50 {
+		t.Fatalf("MatchIndex[2] = %d, want 50", match)
+	}
+}
+
+// Every receiver outcome must be distinguishable by the leader. A restore that
+// errors, and a snapshot already covered, are not successes it may count.
+func TestHandleInstallSnapshot_ReportsSuccessAccurately(t *testing.T) {
+	t.Run("restore failure is not success", func(t *testing.T) {
+		rn := newTestNode(t, 1, []int{2, 3}, 3)
+		rl := newTestLog(t)
+		resp := rn.HandleInstallSnapshot(rl, InstallSnapshotRequest{
+			Term: 1, LeaderID: 2, LastIncludedIndex: 50, LastIncludedTerm: 1,
+		},
+			func([]byte) error { return errors.New("corrupt snapshot") },
+			func() error { return nil },
+		)
+		if resp.Success {
+			t.Fatal("restore failed but the response reported Success")
+		}
+	})
+
+	t.Run("persist failure is not success", func(t *testing.T) {
+		rn := newTestNode(t, 1, []int{2, 3}, 3)
+		rl := newTestLog(t)
+		resp := rn.HandleInstallSnapshot(rl, InstallSnapshotRequest{
+			Term: 1, LeaderID: 2, LastIncludedIndex: 50, LastIncludedTerm: 1,
+		},
+			func([]byte) error { return nil },
+			func() error { return errors.New("disk full") },
+		)
+		if resp.Success {
+			t.Fatal("persist failed but the response reported Success")
+		}
+	})
+
+	t.Run("stale term is not success", func(t *testing.T) {
+		rn := newTestNode(t, 1, []int{2, 3}, 3)
+		rl := newTestLog(t)
+		if err := rn.BecomeFollower(7, 2); err != nil {
+			t.Fatalf("seed term: %v", err)
+		}
+		resp := rn.HandleInstallSnapshot(rl, InstallSnapshotRequest{
+			Term: 3, LeaderID: 2, LastIncludedIndex: 50, LastIncludedTerm: 3,
+		},
+			func([]byte) error { return nil },
+			func() error { return nil },
+		)
+		if resp.Success {
+			t.Fatal("stale-term request reported Success")
+		}
+	})
+
+	// Already covered IS a success: the follower genuinely holds everything
+	// through that index, which is exactly what the leader is asking about.
+	t.Run("already covered is success", func(t *testing.T) {
+		rn := newTestNode(t, 1, []int{2, 3}, 3)
+		rl := newTestLog(t)
+		if err := rl.RestoreOffset(60, 4); err != nil {
+			t.Fatalf("RestoreOffset: %v", err)
+		}
+		resp := rn.HandleInstallSnapshot(rl, InstallSnapshotRequest{
+			Term: 4, LeaderID: 2, LastIncludedIndex: 50, LastIncludedTerm: 4,
+		},
+			func([]byte) error { return nil },
+			func() error { return nil },
+		)
+		if !resp.Success {
+			t.Fatal("a snapshot we already cover should report Success")
+		}
+	})
+
+	t.Run("successful install is success", func(t *testing.T) {
+		rn := newTestNode(t, 1, []int{2, 3}, 3)
+		rl := newTestLog(t)
+		resp := rn.HandleInstallSnapshot(rl, InstallSnapshotRequest{
+			Term: 1, LeaderID: 2, LastIncludedIndex: 50, LastIncludedTerm: 1,
+		},
+			func([]byte) error { return nil },
+			func() error { return nil },
+		)
+		if !resp.Success {
+			t.Fatal("a clean install did not report Success")
+		}
+	})
+}

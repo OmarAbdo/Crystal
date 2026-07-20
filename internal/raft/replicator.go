@@ -112,6 +112,15 @@ func (r *Replicator) InstallSnapshotTo(node *RaftNode, peerID int, addr string, 
 		return result.Term // stale leader
 	}
 
+	// Advance the peer's progress ONLY on a confirmed install. matchIndex feeds
+	// AdvanceCommitIndex, so crediting a follower that did not store the snapshot
+	// manufactures a quorum for data it does not have.
+	if !result.Success {
+		stdlog.Printf("[REPLICATOR] Peer %d did not install the snapshot at index %d",
+			peerID, req.LastIncludedIndex)
+		return result.Term
+	}
+
 	// The follower is now caught up through the snapshot boundary.
 	node.UpdatePeerProgress(peerID, req.LastIncludedIndex)
 	return result.Term

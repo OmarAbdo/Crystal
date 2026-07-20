@@ -400,9 +400,12 @@ func (rn *RaftNode) HandleInstallSnapshot(
 	}
 	rn.lastContact = time.Now() // a valid snapshot is a sign of life
 
-	// If we already cover this snapshot's index, it's stale — ack and move on.
+	// If we already cover this snapshot's index there is nothing to do — but this
+	// IS a success: we genuinely hold everything through that index, which is
+	// exactly what the leader is asking about. Reporting failure here would stall
+	// a follower that is already caught up.
 	if req.LastIncludedIndex <= rl.FirstIndex()-1 {
-		return InstallSnapshotResponse{Term: currentTerm}
+		return InstallSnapshotResponse{Term: currentTerm, Success: true}
 	}
 
 	// Step 8: reset the state machine from the snapshot data.
@@ -438,7 +441,7 @@ func (rn *RaftNode) HandleInstallSnapshot(
 
 	log.Printf("[RAFT] Installed snapshot through index %d term %d",
 		req.LastIncludedIndex, req.LastIncludedTerm)
-	return InstallSnapshotResponse{Term: currentTerm}
+	return InstallSnapshotResponse{Term: currentTerm, Success: true}
 }
 
 // snapshotFloor returns the follower's current compaction boundary, used to

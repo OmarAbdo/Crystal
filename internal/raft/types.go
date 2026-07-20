@@ -85,9 +85,19 @@ type InstallSnapshotRequest struct {
 }
 
 // InstallSnapshotResponse carries the follower's term so a stale leader can
-// detect it must step down.
+// detect it must step down, and whether the snapshot was actually installed.
+//
+// Figure 13 returns only the term, because the paper's receiver has no failure
+// modes short of a stale term: the snapshot is written to a file and the state
+// machine is reset, and neither is modelled as fallible. Ours are — restore can
+// reject corrupt data, persist can hit a full disk, the log reset can fail — and
+// the leader advances the peer's matchIndex on the strength of this reply.
+// Without Success, a follower that failed to install is indistinguishable from
+// one holding the data, so a phantom quorum commits entries stored on a single
+// server. Leader Completeness, lost to a missing bool.
 type InstallSnapshotResponse struct {
-	Term int `json:"term"`
+	Term    int  `json:"term"`
+	Success bool `json:"success"` // true only if the snapshot is installed and durable
 }
 
 // PersistentState is the Raft state that MUST survive node restarts.
