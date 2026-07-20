@@ -5,9 +5,21 @@ package raft
 // Lock discipline (critical — prevents deadlocks):
 //   - RaftNode.mu protects all fields on RaftNode itself.
 //   - RaftLog.mu protects all fields on RaftLog.
-//   - These two locks are NEVER held simultaneously by the same goroutine.
-//   - Any method that needs data from both acquires one, reads what it needs,
-//     releases it, then acquires the other.
+//   - The two may be held at once, but only in the ORDER rn.mu → rl.mu. A
+//     goroutine holding rl.mu must never try to take rn.mu.
+//
+// This ordering is safe by construction, not by vigilance: RaftLog holds no
+// reference to RaftNode and calls nothing on it, so the reverse edge cannot be
+// written without first adding that dependency. Keep it that way — the moment a
+// RaftLog method needs to consult the node, this invariant has to be re-derived
+// rather than assumed.
+//
+// An earlier version of this comment claimed the two locks were NEVER held
+// simultaneously. That was already false when it was written (AdvanceCommitIndex
+// calls termAt, which takes rl.mu, while holding rn.mu), and the RPC receivers
+// now hold rn.mu across their log work deliberately — the term decision and the
+// log mutation it authorizes have to be one atomic step, or a stale-term request
+// can splice entries in behind a concurrent term change.
 //
 // Persistent state (CurrentTerm, VotedFor) is written to a small JSON
 // metadata file on every term change. This is separate from the WAL because:
@@ -194,8 +206,10 @@ func (rn *RaftNode) BacktrackNextIndex(peerID, conflictIndex int) {
 // Previous-term entries commit implicitly, once a current-term entry above them
 // reaches quorum.
 //
-// termAt returns the term of the entry at a given log index (supplied by the
-// caller so this method never touches the RaftLog lock while holding rn.mu).
+// termAt returns the term of the entry at a given log index. It is supplied by
+// the caller rather than read from a stored RaftLog reference so that RaftNode
+// keeps no dependency on the log type. It is invoked while rn.mu is held, which
+// is permitted: the lock order is rn.mu → rl.mu (see the file header).
 func (rn *RaftNode) AdvanceCommitIndex(localLatestIndex int, termAt func(index int) int, currentTerm int) (newCommitIndex int, advanced bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
