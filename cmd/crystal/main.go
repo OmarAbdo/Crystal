@@ -113,9 +113,10 @@ func (b *rpcBinding) HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft
 }
 
 func (b *rpcBinding) HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse {
-	// Supply the voter's last log index/term for the §5.4.1 up-to-date check,
-	// read under the log's own lock (never held together with the node's lock).
-	return b.node.HandleRequestVote(req, b.log.LatestIndex(), b.log.LatestTerm())
+	// Pass the log-state reader itself, not a pre-read snapshot: HandleRequestVote
+	// samples it inside its critical section so the §5.4.1 up-to-date check cannot
+	// be decided against a log that has since moved on.
+	return b.node.HandleRequestVote(req, b.log.LastLogState)
 }
 
 // restoreFromSnapshot loads the latest snapshot (if any) into the state machine

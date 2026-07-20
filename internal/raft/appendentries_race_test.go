@@ -223,3 +223,88 @@ func TestHandleInstallSnapshot_StaleTermDoesNotInstall(t *testing.T) {
 		t.Fatalf("commit/applied = %d/%d, want 0/0", commit, applied)
 	}
 }
+
+// ---- F1c: the vote decision must read log state under the node lock ----
+
+// The §5.4.1 election restriction compares the candidate's last log entry against
+// our own. If our side of that comparison is sampled before the vote's critical
+// section, it can be stale by the time it is used: a concurrent AppendEntries can
+// extend our log between the sample and the decision, and we grant a vote to a
+// candidate that is no longer as up-to-date as we are. That is exactly the
+// guarantee Leader Completeness rests on.
+
+// TestLastLogState_ConsistentPair covers the narrower half of the same problem:
+// reading index and term through two separate lock acquisitions can tear, pairing
+// one entry's index with another's term.
+func TestLastLogState_ConsistentPair(t *testing.T) {
+	rl := newTestLog(t)
+
+	idx, term := rl.LastLogState()
+	if idx != 0 || term != 0 {
+		t.Fatalf("empty log: got (%d,%d), want (0,0)", idx, term)
+	}
+
+	if _, err := rl.AppendLeader([]byte(`{"op":"noop"}`), 3); err != nil {
+		t.Fatalf("AppendLeader: %v", err)
+	}
+	if _, err := rl.AppendLeader([]byte(`{"op":"noop"}`), 4); err != nil {
+		t.Fatalf("AppendLeader: %v", err)
+	}
+
+	idx, term = rl.LastLogState()
+	if idx != 2 || term != 4 {
+		t.Fatalf("got (%d,%d), want (2,4)", idx, term)
+	}
+
+	// After compaction the pair must describe the snapshot boundary, still
+	// consistently.
+	if err := rl.TruncateBeforeIndex(2, 4); err != nil {
+		t.Fatalf("TruncateBeforeIndex: %v", err)
+	}
+	idx, term = rl.LastLogState()
+	if idx != 2 || term != 4 {
+		t.Fatalf("after compaction: got (%d,%d), want (2,4)", idx, term)
+	}
+}
+
+// The log state must be sampled while rn.mu is held, so nothing can change it
+// between the sample and the vote. Proven by showing that a goroutine contending
+// for rn.mu cannot make progress while the callback is running.
+func TestHandleRequestVote_ReadsLogStateUnderLock(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+
+	contenderDone := make(chan struct{})
+	callbackRan := make(chan struct{})
+
+	lastLogState := func() (int, int) {
+		close(callbackRan)
+		// While we are here the node lock must be held, so the contender below
+		// cannot complete.
+		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-contenderDone:
+			t.Error("another goroutine mutated the node while the vote was " +
+				"sampling log state — the sample is not inside the critical section")
+		default:
+		}
+		return 0, 0
+	}
+
+	go func() {
+		<-callbackRan
+		// Any node mutation will do; this one needs the write lock.
+		if err := rn.BecomeFollower(9, 2); err != nil {
+			t.Errorf("BecomeFollower: %v", err)
+		}
+		close(contenderDone)
+	}()
+
+	resp := rn.HandleRequestVote(RequestVoteRequest{
+		Term: 1, CandidateID: 2, LastLogIndex: 0, LastLogTerm: 0,
+	}, lastLogState)
+
+	if !resp.VoteGranted {
+		t.Fatal("expected the vote to be granted")
+	}
+	<-contenderDone
+}

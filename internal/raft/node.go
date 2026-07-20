@@ -508,9 +508,18 @@ func (rn *RaftNode) RecordVoteAndCheckMajority(voteTerm int) (wonMajority bool) 
 // single authority for the vote decision, keeping consensus logic out of
 // transport. The §5.4.1 election restriction is enforced via the up-to-date
 // comparison. Vote grants are persisted before responding (stable-storage rule).
-func (rn *RaftNode) HandleRequestVote(req RequestVoteRequest, myLastIndex, myLastTerm int) RequestVoteResponse {
+// lastLogState is supplied as a callback rather than as two pre-read values so
+// that our side of the §5.4.1 comparison is sampled INSIDE the vote's critical
+// section. Sampling it beforehand lets a concurrent AppendEntries extend our log
+// between the sample and the decision, so we would grant a vote to a candidate
+// that is no longer as up-to-date as we are — and the election restriction is
+// precisely what Leader Completeness rests on. Calling it here is legal under the
+// rn.mu → rl.mu order (see the file header).
+func (rn *RaftNode) HandleRequestVote(req RequestVoteRequest, lastLogState func() (index, term int)) RequestVoteResponse {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
+
+	myLastIndex, myLastTerm := lastLogState()
 
 	// Step 1: reject a candidate from an older term.
 	if req.Term < rn.persistent.CurrentTerm {

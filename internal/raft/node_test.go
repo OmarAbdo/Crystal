@@ -16,6 +16,14 @@ func newTestNode(t *testing.T, nodeID int, peerIDs []int, clusterSize int) *Raft
 	return rn
 }
 
+// staticLogState adapts a fixed (index, term) pair to the callback
+// HandleRequestVote takes. Real callers pass RaftLog.LastLogState, which is read
+// inside the vote's critical section; tests that are not exercising that timing
+// just need a constant.
+func staticLogState(index, term int) func() (int, int) {
+	return func() (int, int) { return index, term }
+}
+
 // ---- §5.4.1 up-to-date comparison ----
 
 func TestCandidateUpToDate(t *testing.T) {
@@ -50,7 +58,7 @@ func TestHandleRequestVote_GrantsWhenEligible(t *testing.T) {
 
 	resp := rn.HandleRequestVote(RequestVoteRequest{
 		Term: 1, CandidateID: 2, LastLogIndex: 0, LastLogTerm: 0,
-	}, 0, 0)
+	}, staticLogState(0, 0))
 
 	if !resp.VoteGranted {
 		t.Fatalf("expected vote granted")
@@ -72,7 +80,7 @@ func TestHandleRequestVote_RejectsStaleTerm(t *testing.T) {
 
 	resp := rn.HandleRequestVote(RequestVoteRequest{
 		Term: 3, CandidateID: 2, LastLogIndex: 10, LastLogTerm: 5,
-	}, 0, 0)
+	}, staticLogState(0, 0))
 
 	if resp.VoteGranted {
 		t.Fatalf("expected rejection of stale-term candidate")
@@ -86,13 +94,13 @@ func TestHandleRequestVote_RejectsWhenAlreadyVotedOther(t *testing.T) {
 	rn := newTestNode(t, 1, []int{2, 3}, 3)
 
 	// Grant to candidate 2 for term 1.
-	first := rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, 0, 0)
+	first := rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, staticLogState(0, 0))
 	if !first.VoteGranted {
 		t.Fatalf("setup: first vote should be granted")
 	}
 
 	// Candidate 3 asks for the same term — must be denied (one vote per term).
-	second := rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 3}, 0, 0)
+	second := rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 3}, staticLogState(0, 0))
 	if second.VoteGranted {
 		t.Fatalf("expected denial: already voted for candidate 2 this term")
 	}
@@ -101,9 +109,9 @@ func TestHandleRequestVote_RejectsWhenAlreadyVotedOther(t *testing.T) {
 func TestHandleRequestVote_GrantIsIdempotentForSameCandidate(t *testing.T) {
 	rn := newTestNode(t, 1, []int{2, 3}, 3)
 
-	rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, 0, 0)
+	rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, staticLogState(0, 0))
 	// Same candidate re-asks (e.g. retransmit) — should still be granted.
-	resp := rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, 0, 0)
+	resp := rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, staticLogState(0, 0))
 	if !resp.VoteGranted {
 		t.Fatalf("expected repeat grant to same candidate")
 	}
@@ -115,7 +123,7 @@ func TestHandleRequestVote_RejectsLessUpToDateLog(t *testing.T) {
 	// Our log is at index 5 term 3. Candidate's log ends at term 2 — behind us.
 	resp := rn.HandleRequestVote(RequestVoteRequest{
 		Term: 4, CandidateID: 2, LastLogIndex: 9, LastLogTerm: 2,
-	}, 5 /*myLastIndex*/, 3 /*myLastTerm*/)
+	}, staticLogState(5 /*myLastIndex*/, 3 /*myLastTerm*/))
 
 	if resp.VoteGranted {
 		t.Fatalf("expected denial: candidate log is less up-to-date (§5.4.1)")
@@ -130,10 +138,10 @@ func TestHandleRequestVote_HigherTermResetsPriorVote(t *testing.T) {
 	rn := newTestNode(t, 1, []int{2, 3}, 3)
 
 	// Vote for candidate 2 in term 1.
-	rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, 0, 0)
+	rn.HandleRequestVote(RequestVoteRequest{Term: 1, CandidateID: 2}, staticLogState(0, 0))
 	// Candidate 3 arrives with a higher term 2 — the higher term clears the old
 	// vote, so 3 is now eligible.
-	resp := rn.HandleRequestVote(RequestVoteRequest{Term: 2, CandidateID: 3}, 0, 0)
+	resp := rn.HandleRequestVote(RequestVoteRequest{Term: 2, CandidateID: 3}, staticLogState(0, 0))
 	if !resp.VoteGranted {
 		t.Fatalf("expected grant: higher term should reset prior vote")
 	}
@@ -305,7 +313,7 @@ func TestBecomeLeader_NoOpAfterStepdown(t *testing.T) {
 func TestBecomeFollower_SameTermPreservesVote(t *testing.T) {
 	rn := newTestNode(t, 1, []int{2, 3}, 3)
 	// Cast a vote for candidate 2 at term 3.
-	rn.HandleRequestVote(RequestVoteRequest{Term: 3, CandidateID: 2}, 0, 0)
+	rn.HandleRequestVote(RequestVoteRequest{Term: 3, CandidateID: 2}, staticLogState(0, 0))
 	if rn.persistent.VotedFor != 2 {
 		t.Fatalf("setup: VotedFor = %d, want 2", rn.persistent.VotedFor)
 	}
@@ -323,7 +331,7 @@ func TestBecomeFollower_SameTermPreservesVote(t *testing.T) {
 // does clear the old vote so we can vote again in the new term.
 func TestBecomeFollower_HigherTermClearsVote(t *testing.T) {
 	rn := newTestNode(t, 1, []int{2, 3}, 3)
-	rn.HandleRequestVote(RequestVoteRequest{Term: 3, CandidateID: 2}, 0, 0)
+	rn.HandleRequestVote(RequestVoteRequest{Term: 3, CandidateID: 2}, staticLogState(0, 0))
 
 	if err := rn.BecomeFollower(4, 3); err != nil { // higher term
 		t.Fatalf("BecomeFollower: %v", err)
@@ -345,7 +353,7 @@ func TestPersistentStateSurvivesReload(t *testing.T) {
 	if err := rn.BecomeFollower(7, 0); err != nil {
 		t.Fatalf("BecomeFollower: %v", err)
 	}
-	rn.HandleRequestVote(RequestVoteRequest{Term: 7, CandidateID: 3}, 0, 0)
+	rn.HandleRequestVote(RequestVoteRequest{Term: 7, CandidateID: 3}, staticLogState(0, 0))
 
 	// Reload from the same metadata file — term and vote must persist.
 	rn2, err := NewRaftNode(1, []int{2, 3}, 3, meta, Follower)
@@ -426,7 +434,7 @@ func TestHandleRequestVote_PersistFailureDoesNotRecordVote(t *testing.T) {
 
 	resp := rn.HandleRequestVote(RequestVoteRequest{
 		Term: 9, CandidateID: 2, LastLogIndex: 0, LastLogTerm: 0,
-	}, 0, 0)
+	}, staticLogState(0, 0))
 
 	if resp.VoteGranted {
 		t.Fatal("vote granted despite persist failure")

@@ -317,6 +317,24 @@ func (rl *RaftLog) LatestTerm() int {
 	return rl.cache[len(rl.cache)-1].Term
 }
 
+// LastLogState returns the index and term of the last entry as one consistent
+// pair, under a single lock acquisition.
+//
+// Callers need both halves to describe the same moment. Reading them through
+// separate LatestIndex/LatestTerm calls can tear — an append between the two
+// yields one entry's index paired with another's term — and the §5.4.1
+// up-to-date comparison built on that pair would be comparing against a log
+// state that never existed.
+func (rl *RaftLog) LastLogState() (index, term int) {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+	if len(rl.cache) == 0 {
+		return rl.lastIncludedIndex, rl.lastIncludedTerm
+	}
+	last := rl.cache[len(rl.cache)-1]
+	return last.Index, last.Term
+}
+
 // FirstIndex returns the lowest log index still present in the cache
 // (lastIncludedIndex + 1). The leader uses it to decide whether a follower's
 // nextIndex has fallen below the compacted boundary and needs a snapshot.
