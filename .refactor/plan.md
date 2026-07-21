@@ -94,6 +94,27 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
 
 ## Open work
 
+### Read scalability — done (2026-07-21, from design review with Omar)
+
+The original F12 made reads linearizable but leader-only, which pinned read
+capacity to one machine — the wrong shape for a coordination store, where reads
+outnumber writes heavily. Two findings came out of that discussion:
+
+- [x] **F21 — followers serve linearizable reads.** *(done `81ad47c`)* The
+      mistake was conflating two things: ReadIndex needs the LEADER to supply the
+      index, not to serve the read. New `ReadIndex` RPC — a follower fetches a
+      quorum-confirmed index, waits for its own apply to reach it, and answers
+      locally. Only an integer crosses the network, so read capacity scales with
+      the cluster. Cost: one round trip of latency per follower read, traded for
+      throughput deliberately.
+- [x] **F22 — bounded-staleness tier.** *(done `0710ae9`)* `ReadOptions` with a
+      `Consistency` enum (zero value = `Linearizable`, so the safe mode is the
+      accidental default — a `bool` would have inverted that) and a **required**
+      `MaxStaleness`. The bound measures time since this node last confirmed
+      currency with a leader, and applies to the leader too. Needs no clock-skew
+      assumption: both ends of the interval are measured on one machine.
+      Unbounded reads are demoted to `?consistency=local`, an ops/debug tool.
+
 - [x] **F19 — a leader that loses its quorum never steps down.** *(done
       `66b5b4d`, with F12 as planned — they share the per-peer ack machinery)* *(found
       2026-07-21 while writing the F18 minority test; not in the original review)*
