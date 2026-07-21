@@ -201,7 +201,24 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
 
 ## Phase 6 — §6 disruption avoidance and membership
 
-- [ ] **F13 — no leader-stickiness check on `RequestVote`.**
+- [x] **F13 — no leader-stickiness check on `RequestVote`.** *(done `8fc7be0`)*
+      — but **necessary, not sufficient**. Writing the harness test showed the
+      disruption never travels through RequestVote at all: the isolated node's
+      inflated term reaches the leader via the **AppendEntries response**, which
+      Figure 2 obliges it to honour. §6's check stops the vote, not the term.
+      Hence F20.
+
+- [x] **F20 — no pre-vote.** *(found 2026-07-21 while testing F13; done
+      `bb3d553`)* An isolated node spent a term on every timeout and returned far
+      ahead of the cluster. Pre-vote (dissertation §9.6) asks a majority whether a
+      campaign could succeed *before* incrementing anything, so a node that cannot
+      reach a quorum never moves its term and has nothing disruptive to say on
+      rejoin. `HandlePreVote` changes no state at all — that is what makes the
+      poll safe. Measured before: isolated node reached term 5 vs cluster term 1,
+      dragged the leader to 7. After: term held through 2s of failed polls,
+      genuine failover still ~540ms.
+
+      Original analysis:
       ([node.go:442](../internal/raft/node.go#L442)) §6, final paragraph:
       "if a server receives a RequestVote RPC within the minimum election timeout
       of hearing from a current leader, it does not update its term or grant its
@@ -229,22 +246,22 @@ crashes. Only **F4** remains — see Phase 5 below, where it now sits.
 
 Batchable; each still gets its own commit.
 
-- [ ] **M1** — `parsePeers` must reject the node's own ID (see F16).
-- [ ] **M2** — cache positional invariant. `AppendEntriesToLog`
+- [x] **M1** *(done `6c811f4`)* — `parsePeers` must reject the node's own ID (see F16).
+- [x] **M2** *(done `6c811f4`)* — cache positional invariant. `AppendEntriesToLog`
       ([log.go:260](../internal/raft/log.go#L260)) appends without checking
       `entry.Index == firstIndex + len(cache)`. That invariant underpins every
       `getEntryLocked`; a violation is silent and unrecoverable. Assert it.
       Related: `rl.cache[:entry.Index-rl.firstIndex]`
       ([log.go:248](../internal/raft/log.go#L248)) panics on a negative bound.
-- [ ] **M3** — `UpdatePeerProgress` ([node.go:132](../internal/raft/node.go#L132))
+- [x] **M3** *(done `6c811f4`)* — `UpdatePeerProgress` ([node.go:132](../internal/raft/node.go#L132))
       silently creates a map entry for an unknown `peerID`, which would inflate
       the `indices` slice in `AdvanceCommitIndex` and shift the quorum median.
       Reject unknown peers explicitly.
-- [ ] **M4** — `buildSnapshotRequest` ([engine.go:474](../internal/engine/engine.go#L474))
+- [x] **M4** *(done `6c811f4`)* — `buildSnapshotRequest` ([engine.go:474](../internal/engine/engine.go#L474))
       re-reads and re-encodes the snapshot from disk on every replication round;
       at a 100ms heartbeat that is 10 full reads/sec per lagging follower. Cache
       it, keyed on `LastIncludedIndex`.
-- [ ] **M5** — `writeEntryToDisk` ([log.go:498](../internal/raft/log.go#L498))
+- [x] **M5** *(done `6c811f4`)* — `writeEntryToDisk` ([log.go:498](../internal/raft/log.go#L498))
       fsyncs per entry, so a 100-entry batch does 100 fsyncs. Batch the writes
       and sync once, as `rewriteWALLocked` already does.
 - [x] **M6** — done in `b4e1033`. `cmd/crystal/data/raft.wal` and `raft.meta`
