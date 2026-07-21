@@ -204,7 +204,21 @@ outnumber writes heavily. Two findings came out of that discussion:
       > index is recorded. Carry a per-peer round-start counter through the ack
       > channel and count only rounds that started after registration.
 
-- [ ] **F14 — no exactly-once client semantics.** No client IDs, no serial
+- [x] **F14 — no exactly-once client semantics.** *(done `a743bd3`)* — optional
+      `ClientID`/`Seq` on `Command`; per-client last-sequence + outcome in the
+      state machine, replayed for retransmissions. The dedup table is **in the
+      snapshot** (omitting it would make a restored node re-apply retries).
+      Required decoupling `SnapshotFile.State` to `json.RawMessage`, which also
+      removed a pointless decode/re-encode round trip. `ErrCommitTimeout`'s
+      documentation corrected — it never meant the write failed.
+
+      **Follow-up filed: F23 — sessions never expire.** The table grows one entry
+      per distinct client forever and rides in every snapshot. The fix is client
+      leases (register / renew / reclaim on lapse), which also lets a client learn
+      its session is gone and that retries are no longer safe. A bare LRU would
+      silently reopen the hole F14 closes and is the wrong answer.
+
+      Original analysis: No client IDs, no serial
       numbers, no dedup table. Concretely, `ErrCommitTimeout`
       ([engine.go:211](../internal/engine/engine.go#L211)) is a lie: the entry
       stays in the log and usually commits afterwards, so the client's retry
