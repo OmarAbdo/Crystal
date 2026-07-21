@@ -114,9 +114,15 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 // ---- Public client-facing handlers ----
 
+// setRequest is a write. ClientID and Seq are optional, and supplying them is
+// how a client opts into exactly-once semantics (§8): a retry after a timeout is
+// then recognized as a retransmission rather than applied a second time.
 type setRequest struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+
+	ClientID string `json:"client_id,omitempty"`
+	Seq      uint64 `json:"seq,omitempty"`
 }
 
 func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
@@ -141,11 +147,26 @@ func (s *Server) handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.submitAndRespond(w, raft.Command{Op: raft.OpSet, Key: req.Key, Value: req.Value})
+	if err := validateClientTag(req.ClientID, req.Seq); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.submitAndRespond(w, raft.Command{
+		Op: raft.OpSet, Key: req.Key, Value: req.Value,
+		ClientID: req.ClientID, Seq: req.Seq,
+	})
 }
 
+// deleteRequest is a delete. Supplying ClientID and Seq matters MORE here than
+// for a set: a retried delete after the key has been recreated by someone else
+// destroys the new value. The hazard is not repetition, it is repetition after
+// the world has moved on.
 type deleteRequest struct {
 	Key string `json:"key"`
+
+	ClientID string `json:"client_id,omitempty"`
+	Seq      uint64 `json:"seq,omitempty"`
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +191,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.submitAndRespond(w, raft.Command{Op: raft.OpDelete, Key: req.Key})
+	if err := validateClientTag(req.ClientID, req.Seq); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.submitAndRespond(w, raft.Command{
+		Op: raft.OpDelete, Key: req.Key,
+		ClientID: req.ClientID, Seq: req.Seq,
+	})
 }
 
 // handleGet serves a read. Three tiers, and the default is the safe one:
@@ -401,6 +430,25 @@ func (s *Server) handleInternalSnapshot(w http.ResponseWriter, r *http.Request) 
 }
 
 // ---- Shared helpers ----
+
+// validateClientTag rejects a half-specified client tag. A ClientID without a
+// Seq cannot be deduplicated (every request would look like sequence zero, so
+// the second one would be discarded as a duplicate of the first), and a Seq
+// without a ClientID has nothing to be a sequence OF. Either both or neither.
+func validateClientTag(clientID string, seq uint64) error {
+	switch {
+	case clientID == "" && seq == 0:
+		return nil // opted out of exactly-once
+	case clientID == "":
+		return fmt.Errorf("seq given without client_id: a sequence number needs " +
+			"a client to be a sequence of")
+	case seq == 0:
+		return fmt.Errorf("client_id given without seq: exactly-once needs a " +
+			"per-client sequence number, starting at 1")
+	default:
+		return nil
+	}
+}
 
 // redirectToLeader rejects a write with 421 and tells the client where the
 // leader actually is.

@@ -549,3 +549,55 @@ func TestBoundedReadContract(t *testing.T) {
 		t.Fatalf("unknown consistency: code=%d, want 400", resp.StatusCode)
 	}
 }
+
+// TestExactlyOnceOverHTTP exercises the client-tag contract on the real wire: a
+// retried delete does not destroy a value written after the original.
+func TestExactlyOnceOverHTTP(t *testing.T) {
+	bin := buildBinary(t)
+	nodes := startCluster(t, bin, 3)
+
+	leader := findLeader(t, nodes, "seed", "0", 8*time.Second)
+
+	post := func(path, body string) int {
+		resp, err := http.Post("http://"+leader.addr()+path, "application/json",
+			bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// A half-specified tag is rejected rather than silently ignored.
+	if code := post("/set", `{"key":"x","value":"1","client_id":"c1"}`); code != http.StatusBadRequest {
+		t.Fatalf("client_id without seq: code=%d, want 400", code)
+	}
+	if code := post("/set", `{"key":"x","value":"1","seq":3}`); code != http.StatusBadRequest {
+		t.Fatalf("seq without client_id: code=%d, want 400", code)
+	}
+
+	if code := post("/set", `{"key":"k","value":"original"}`); code != http.StatusOK {
+		t.Fatalf("seed write: code=%d", code)
+	}
+	if code := post("/delete", `{"key":"k","client_id":"c1","seq":1}`); code != http.StatusOK {
+		t.Fatalf("tagged delete: code=%d", code)
+	}
+	if code := post("/set", `{"key":"k","value":"recreated"}`); code != http.StatusOK {
+		t.Fatalf("recreate: code=%d", code)
+	}
+	waitConverged(t, nodes, "k", "recreated", 8*time.Second)
+
+	// The client retries its delete, unaware the original committed.
+	if code := post("/delete", `{"key":"k","client_id":"c1","seq":1}`); code != http.StatusOK {
+		t.Fatalf("retried delete: code=%d", code)
+	}
+
+	body, code, err := tryGetLinearizable(leader.addr(), "k")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if code != http.StatusOK || !bytes.Contains([]byte(body), []byte("recreated")) {
+		t.Fatalf("after retried delete: code=%d body=%q, want the recreated value "+
+			"— the retransmission was applied twice", code, body)
+	}
+}

@@ -8,8 +8,17 @@ import "errors"
 // address in X-Raft-Leader when one is known.
 var ErrNotLeader = errors.New("not the leader")
 
-// ErrCommitTimeout is returned when quorum was not reached within the deadline.
-var ErrCommitTimeout = errors.New("commit timeout: lost quorum or cluster degraded")
+// ErrCommitTimeout is returned when a proposal was not committed within the
+// deadline.
+//
+// It does NOT mean the write failed. The entry is still in the log and will very
+// likely commit shortly after we give up saying so — this is the classic
+// at-least-once hazard, and it is why a client that retries on this error can
+// apply its command twice. A client that supplies client_id and seq (F14) is
+// safe to retry: the state machine recognizes the retransmission and replays the
+// original outcome rather than executing it again. A client that does not
+// identify itself is retrying at its own risk.
+var ErrCommitTimeout = errors.New("commit timeout: not committed within the deadline (the entry may still commit)")
 
 // errUnreachable stands in for a transport failure in tests that never intend
 // to exercise the network.

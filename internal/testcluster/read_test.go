@@ -371,3 +371,67 @@ func TestBoundedRead_PartitionedLeaderIsAlsoStale(t *testing.T) {
 	}
 	t.Fatal("partitioned leader kept serving bounded reads past its budget")
 }
+
+// ---- F14: exactly-once client semantics ----
+
+// The end-to-end version of the hazard. A client deletes a key and its request
+// times out — but the entry commits anyway, which is exactly what
+// ErrCommitTimeout does NOT tell you. The client retries. In between, the key is
+// recreated. Without dedup the retry destroys the new value.
+func TestTaggedRetryDoesNotReapplyDelete(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "original", 3*time.Second); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := c.DeleteTagged(leader, "k", "client-a", 1, 3*time.Second); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Someone recreates the key.
+	if err := c.SetVia(leader, "k", "recreated", 3*time.Second); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "recreated", 5*time.Second)
+
+	// The original client retries its delete, unaware the first one landed.
+	if err := c.DeleteTagged(leader, "k", "client-a", 1, 3*time.Second); err != nil {
+		t.Fatalf("retried delete: %v", err)
+	}
+
+	got, ok, err := c.Read(leader, "k", 3*time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !ok || got != "recreated" {
+		t.Fatalf("k = %q (found=%v), want recreated — a retried delete was applied "+
+			"a second time and destroyed a later write", got, ok)
+	}
+}
+
+// Dedup must hold across every replica, not just the one that served the write:
+// each node applies the same log and must reach the same conclusion.
+func TestTaggedRetryDedupesOnEveryReplica(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetTagged(leader, "k", "v1", "client-a", 1, 3*time.Second); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := c.SetVia(leader, "k", "v2", 3*time.Second); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	// The retransmission of seq 1 must be ignored everywhere.
+	if err := c.SetTagged(leader, "k", "v1", "client-a", 1, 3*time.Second); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+
+	c.WaitApplied(c.ids(), "k", "v2", 5*time.Second)
+	for _, id := range c.ids() {
+		if got, _ := c.Nodes[id].Store.Get("k"); got != "v2" {
+			t.Fatalf("node %d has k=%q, want v2 — a replica re-applied a "+
+				"retransmission", id, got)
+		}
+	}
+}

@@ -1,13 +1,16 @@
 package store
 
 // Snapshot handles durable serialization of state machine state.
-// A snapshot captures the full KV map at a given log index so that
+// A snapshot captures the full state machine at a given log index so that
 // the WAL entries before that index can be discarded (log compaction).
 //
-// Snapshot file format:
-//   [SnapshotMeta JSON header]\n[state JSON payload]
-//
-// Keeping the meta as a readable header makes debugging straightforward.
+// The snapshot file knows the METADATA but not the shape of the state. It
+// carries whatever bytes StateMachine.Snapshot produced, verbatim, and hands
+// them back to StateMachine.Restore unexamined. That matters more than it looks:
+// the state machine's contents are its own business, and a snapshot format that
+// mirrored them would have to change every time they did — which it would have
+// had to when the dedup session table (F14) was added alongside the key-value
+// data.
 
 import (
 	"encoding/json"
@@ -23,10 +26,11 @@ type SnapshotMeta struct {
 	LastIncludedTerm  int `json:"last_included_term"`
 }
 
-// SnapshotFile is the on-disk representation.
+// SnapshotFile is the on-disk representation: metadata the Raft layer needs,
+// plus the state machine's own opaque serialization.
 type SnapshotFile struct {
-	Meta  SnapshotMeta      `json:"meta"`
-	State map[string]string `json:"state"`
+	Meta  SnapshotMeta    `json:"meta"`
+	State json.RawMessage `json:"state"`
 }
 
 // SnapshotManager reads and writes snapshots to a file path.
@@ -51,13 +55,7 @@ func (sm *SnapshotManager) Write(meta SnapshotMeta, stateMachine StateMachine) e
 		return fmt.Errorf("snapshot state machine: %w", err)
 	}
 
-	state, err := snapshotDecode(raw)
-	if err != nil {
-		return fmt.Errorf("decode snapshot for writing: %w", err)
-	}
-
-	sf := SnapshotFile{Meta: meta, State: state}
-	data, err := json.Marshal(sf)
+	data, err := json.Marshal(SnapshotFile{Meta: meta, State: raw})
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
@@ -87,22 +85,11 @@ func (sm *SnapshotManager) Read() (*SnapshotFile, error) {
 	return &sf, nil
 }
 
-// EncodeState re-serializes the snapshot's state map so it can be passed to
-// StateMachine.Restore without the SnapshotFile knowing about the StateMachine type.
+// EncodeState returns the state machine's bytes exactly as they were written, to
+// be handed to StateMachine.Restore or shipped in an InstallSnapshot RPC.
 func (sf *SnapshotFile) EncodeState() ([]byte, error) {
-	return snapshotEncode(sf.State)
-}
-
-// ---- internal serialization helpers shared by StateMachine and SnapshotManager ----
-
-func snapshotEncode(data map[string]string) ([]byte, error) {
-	return json.Marshal(data)
-}
-
-func snapshotDecode(raw []byte) (map[string]string, error) {
-	var m map[string]string
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, fmt.Errorf("decode snapshot state: %w", err)
+	if len(sf.State) == 0 {
+		return nil, fmt.Errorf("snapshot at index %d has no state", sf.Meta.LastIncludedIndex)
 	}
-	return m, nil
+	return sf.State, nil
 }

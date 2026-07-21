@@ -37,10 +37,23 @@ const (
 
 // Command is the application-level payload carried inside a LogEntry.
 // Only the state machine package imports and decodes this type.
+//
+// ClientID and Seq give the state machine what it needs for exactly-once
+// semantics (§8). Raft on its own is at-least-once: a leader can commit an entry
+// and die before answering, the client retries, and the command applies twice.
+// A client that identifies itself and numbers its commands lets the state
+// machine recognize the retransmission and replay the original outcome instead.
+//
+// Both are optional. A command without a ClientID is applied as-is, which keeps
+// ad-hoc clients working — exactly-once is something a client opts into by
+// identifying itself.
 type Command struct {
 	Op    CommandOp `json:"op"`
 	Key   string    `json:"key"`
 	Value string    `json:"value,omitempty"` // empty for delete
+
+	ClientID string `json:"client_id,omitempty"`
+	Seq      uint64 `json:"seq,omitempty"`
 }
 
 // EncodeCommand serializes a Command into bytes for embedding in a LogEntry.

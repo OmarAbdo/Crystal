@@ -270,11 +270,17 @@ func (c *Cluster) Set(key, value string, timeout time.Duration) error {
 // proposal at a node it knows has been deposed or partitioned.
 func (c *Cluster) SetVia(n *Node, key, value string, timeout time.Duration) error {
 	c.t.Helper()
+	return c.propose(n, raft.Command{Op: raft.OpSet, Key: key, Value: value}, timeout)
+}
+
+// propose submits one command and waits for its result.
+func (c *Cluster) propose(n *Node, cmd raft.Command, timeout time.Duration) error {
+	c.t.Helper()
 	resultCh := make(chan error, 1)
 
 	select {
 	case n.Engine.ProposalQueue() <- engine.Proposal{
-		Command:  raft.Command{Op: raft.OpSet, Key: key, Value: value},
+		Command:  cmd,
 		ResultCh: resultCh,
 	}:
 	case <-time.After(timeout):
@@ -312,6 +318,23 @@ func (c *Cluster) ReadBounded(n *Node, key string, maxStaleness, timeout time.Du
 	}
 	v, ok := n.Store.Get(key)
 	return v, ok, nil
+}
+
+// SetTagged proposes a write carrying a client tag, so a retransmission can be
+// recognized by the state machine (§8 exactly-once).
+func (c *Cluster) SetTagged(n *Node, key, value, clientID string, seq uint64, timeout time.Duration) error {
+	c.t.Helper()
+	return c.propose(n, raft.Command{
+		Op: raft.OpSet, Key: key, Value: value, ClientID: clientID, Seq: seq,
+	}, timeout)
+}
+
+// DeleteTagged proposes a tagged delete.
+func (c *Cluster) DeleteTagged(n *Node, key, clientID string, seq uint64, timeout time.Duration) error {
+	c.t.Helper()
+	return c.propose(n, raft.Command{
+		Op: raft.OpDelete, Key: key, ClientID: clientID, Seq: seq,
+	}, timeout)
 }
 
 // Isolate severs a node from the rest of the cluster in both directions. The
