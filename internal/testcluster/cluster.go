@@ -301,6 +301,19 @@ func (c *Cluster) Read(n *Node, key string, timeout time.Duration) (string, bool
 	return v, ok, nil
 }
 
+// ReadBounded performs a bounded-staleness read: answered from n's local state
+// if n can prove it has been in contact with a leader within maxStaleness, and
+// refused otherwise.
+func (c *Cluster) ReadBounded(n *Node, key string, maxStaleness, timeout time.Duration) (string, bool, error) {
+	c.t.Helper()
+	opts := engine.ReadOptions{Consistency: engine.BoundedStale, MaxStaleness: maxStaleness}
+	if err := n.Engine.Read(opts, timeout); err != nil {
+		return "", false, err
+	}
+	v, ok := n.Store.Get(key)
+	return v, ok, nil
+}
+
 // Isolate severs a node from the rest of the cluster in both directions. The
 // node keeps running — it ticks, times out, and campaigns into the void.
 func (c *Cluster) Isolate(id int) {

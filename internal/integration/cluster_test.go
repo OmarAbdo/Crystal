@@ -130,20 +130,18 @@ func trySet(addr, key, value string) (int, error) {
 	return resp.StatusCode, nil
 }
 
-// tryGet reads a key with ?consistency=stale.
+// tryGet reads a key with ?consistency=local.
 //
 // These tests poll individual nodes to watch replication converge, which is
-// exactly what a stale read is for: they are asking "has this entry reached THIS
-// node yet", a question about one replica's local state. A linearizable read
-// answers a different question — "what is the cluster's current value" — and
-// followers correctly refuse it, so using the default here would test the read
-// contract rather than replication.
+// exactly what the local tier is for: they are asking "has this entry reached
+// THIS node yet", a question about one replica's own state rather than about the
+// cluster's current value.
 //
 // tryGetLinearizable covers the default contract separately — and since F21 that
 // contract is served by followers too, so the distinction here is genuinely
 // about consistency rather than about which node you happen to ask.
 func tryGet(addr, key string) (string, int, error) {
-	return doGet(addr, key, "stale")
+	return doGet(addr, key, "local")
 }
 
 // tryGetLinearizable uses the default read path: quorum-confirmed, and servable
@@ -453,9 +451,9 @@ func TestLinearizableReadContract(t *testing.T) {
 			t.Fatalf("follower %d returned %q, want the committed value", nd.id, body)
 		}
 
-		// The explicit stale read still works too.
+		// The explicit local read still works too.
 		if _, code, _ := tryGet(nd.addr(), "lin"); code != http.StatusOK {
-			t.Fatalf("follower %d refused an explicit stale read: code=%d", nd.id, code)
+			t.Fatalf("follower %d refused an explicit local read: code=%d", nd.id, code)
 		}
 	}
 }
@@ -488,5 +486,66 @@ func TestFollowerLinearizableReadIsCurrent(t *testing.T) {
 			t.Fatalf("follower read %d returned %q, want %q — a linearizable read "+
 				"missed an acknowledged write", i, body, v)
 		}
+	}
+}
+
+// TestBoundedReadContract exercises the bounded tier over real HTTP: the bound
+// is required, it is enforced, and the answer reports how much of it was used.
+func TestBoundedReadContract(t *testing.T) {
+	bin := buildBinary(t)
+	nodes := startCluster(t, bin, 3)
+
+	leader := findLeader(t, nodes, "b", "yes", 8*time.Second)
+	waitConverged(t, nodes, "b", "yes", 8*time.Second)
+
+	// max_staleness is required — a client accepting staleness must say how much.
+	resp, err := http.Get("http://" + leader.addr() + "/get?key=b&consistency=bounded")
+	if err != nil {
+		t.Fatalf("bounded read without a bound: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bounded read without max_staleness: code=%d, want 400", resp.StatusCode)
+	}
+
+	// A malformed bound is likewise rejected rather than guessed at.
+	resp, err = http.Get("http://" + leader.addr() + "/get?key=b&consistency=bounded&max_staleness=soon")
+	if err != nil {
+		t.Fatalf("bounded read with a bad bound: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed max_staleness: code=%d, want 400", resp.StatusCode)
+	}
+
+	// With a real bound, every node answers and reports its staleness.
+	for _, nd := range nodes {
+		resp, err := http.Get("http://" + nd.addr() + "/get?key=b&consistency=bounded&max_staleness=2s")
+		if err != nil {
+			t.Fatalf("node %d bounded read: %v", nd.id, err)
+		}
+		body := new(bytes.Buffer)
+		body.ReadFrom(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("node %d bounded read: code=%d body=%q", nd.id, resp.StatusCode, body)
+		}
+		if !bytes.Contains(body.Bytes(), []byte("yes")) {
+			t.Fatalf("node %d returned %q", nd.id, body)
+		}
+		if resp.Header.Get("X-Raft-Staleness") == "" {
+			t.Fatalf("node %d did not report its staleness", nd.id)
+		}
+	}
+
+	// An unknown tier is rejected rather than silently downgraded.
+	resp, err = http.Get("http://" + leader.addr() + "/get?key=b&consistency=eventual")
+	if err != nil {
+		t.Fatalf("unknown consistency: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown consistency: code=%d, want 400", resp.StatusCode)
 	}
 }

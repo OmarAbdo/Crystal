@@ -30,6 +30,10 @@ const (
 // follow it without parsing prose.
 const leaderHintHeader = "X-Raft-Leader"
 
+// stalenessHeader reports how out of date the answering node's knowledge was, so
+// a client that asked for a bound can see how much of it was actually used.
+const stalenessHeader = "X-Raft-Staleness"
+
 // Server holds the dependencies injected into HTTP handlers.
 type Server struct {
 	node         leaderChecker
@@ -58,7 +62,11 @@ type leaderChecker interface {
 // from the leader and then serves the read itself, so this layer does not need
 // to know which role it is running on.
 type reader interface {
-	LinearizableRead(timeout time.Duration) error
+	Read(opts engine.ReadOptions, timeout time.Duration) error
+
+	// Staleness reports how long since this node last confirmed it was current
+	// with a leader, for reporting back to the client.
+	Staleness() time.Duration
 }
 
 // rpcHandler owns the full AppendEntries and RequestVote receiver logic (term
@@ -165,17 +173,24 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.submitAndRespond(w, raft.Command{Op: raft.OpDelete, Key: req.Key})
 }
 
-// handleGet serves a read. It is LINEARIZABLE by default (§8), and ANY node can
-// serve it — a follower fetches a quorum-confirmed read index from the leader,
-// waits for its own state machine to reach that index, and then answers locally.
-// Only the index crosses the network, so read capacity scales with the cluster
-// rather than being pinned to the leader.
+// handleGet serves a read. Three tiers, and the default is the safe one:
 //
-// `?consistency=stale` opts out, reading local state immediately from whichever
-// node is asked. That is the old behavior, and it is genuinely useful — for
-// convergence checks, dashboards, anything that would rather have a fast answer
-// than a current one. It is opt-in because a client that has not thought about
-// staleness should not silently receive it.
+//	?consistency=linearizable  (default) reflects everything committed when the
+//	    read was admitted. ANY node serves it — a follower fetches a
+//	    quorum-confirmed read index from the leader and then answers locally, so
+//	    read capacity scales with the cluster rather than being pinned to one node.
+//
+//	?consistency=bounded&max_staleness=2s  answers from local state, but only if
+//	    this node has confirmed contact with a leader within the bound. A node
+//	    that cannot REFUSES; the bound is enforced, not advisory. max_staleness is
+//	    required — a client accepting staleness has to say how much.
+//
+//	?consistency=local  whatever this node holds, no guarantee at all. An
+//	    operational and debugging tool ("what does THIS node think"), not a
+//	    consistency level.
+//
+// Every answer carries X-Raft-Staleness, so a client can see how much of its
+// budget was actually used.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET required", http.StatusMethodNotAllowed)
@@ -190,14 +205,31 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	switch consistency := r.URL.Query().Get("consistency"); consistency {
 	case "", "linearizable":
-		if !s.awaitLinearizableRead(w) {
-			return // response already written
+		if !s.serveRead(w, engine.ReadOptions{Consistency: engine.Linearizable}) {
+			return
 		}
-	case "stale":
-		// Read whatever this node has, leader or not.
+
+	case "bounded":
+		maxStaleness, err := parseMaxStaleness(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !s.serveRead(w, engine.ReadOptions{
+			Consistency:  engine.BoundedStale,
+			MaxStaleness: maxStaleness,
+		}) {
+			return
+		}
+
+	case "local":
+		// Whatever this node holds, with no guarantee whatsoever. This is an
+		// operational and debugging tool — "what does THIS node think" — not a
+		// consistency level, and it is deliberately not reachable by accident.
+
 	default:
-		http.Error(w, fmt.Sprintf("unknown consistency %q: want linearizable or stale",
-			consistency), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("unknown consistency %q: want linearizable, "+
+			"bounded or local", consistency), http.StatusBadRequest)
 		return
 	}
 
@@ -207,28 +239,54 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set(stalenessHeader, s.reader.Staleness().Truncate(time.Millisecond).String())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"value": val})
 }
 
-// awaitLinearizableRead blocks until the engine confirms a local read is safe.
-// It returns false if the request has been answered with an error instead.
-//
-// The engine deliberately does not see the key. Its only job is to establish
-// that this node's applied state is current as of the moment the read arrived;
-// what gets read afterwards is not a consensus concern.
-func (s *Server) awaitLinearizableRead(w http.ResponseWriter) bool {
-	err := s.reader.LinearizableRead(readTimeout)
+// parseMaxStaleness reads the bound a bounded read must respect. It is REQUIRED:
+// a client asking for possibly-stale data has to say how stale it will tolerate,
+// rather than inheriting a number the server picked for it.
+func parseMaxStaleness(r *http.Request) (time.Duration, error) {
+	raw := r.URL.Query().Get("max_staleness")
+	if raw == "" {
+		return 0, fmt.Errorf("consistency=bounded requires max_staleness (e.g. max_staleness=2s)")
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid max_staleness %q: %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("max_staleness must be positive, got %s", d)
+	}
+	return d, nil
+}
+
+// serveRead asks the engine whether a local read is permissible under opts. It
+// returns false if the request has already been answered with an error.
+func (s *Server) serveRead(w http.ResponseWriter, opts engine.ReadOptions) bool {
+	err := s.reader.Read(opts, readTimeout)
 	switch {
 	case err == nil:
 		return true
+
 	case errors.Is(err, engine.ErrNotLeader):
 		// Either we do not know who leads, or the leader would not confirm. Send
-		// the client to whoever we last saw rather than quietly serving local
-		// state, which is the stale read this path exists to prevent.
+		// the client somewhere useful rather than quietly serving local state.
 		s.redirectToLeader(w)
+
+	case errors.Is(err, engine.ErrTooStale):
+		// The client named a bound and we cannot meet it. Reporting our actual
+		// staleness lets it decide whether to widen the bound or go elsewhere.
+		w.Header().Set(stalenessHeader, s.reader.Staleness().Truncate(time.Millisecond).String())
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+	case errors.Is(err, engine.ErrMaxStalenessRequired):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
 	case errors.Is(err, engine.ErrReadTimeout):
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
 	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

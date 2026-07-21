@@ -121,6 +121,11 @@ type Engine struct {
 	// ackCh carries proof-of-leadership from the replicators to the control loop.
 	ackCh chan ackReport
 
+	// lastQuorumNanos is when a majority was last confirmed reachable, for
+	// bounded-staleness reads. Atomic because the control loop writes it and read
+	// requests on RPC goroutines read it.
+	lastQuorumNanos atomic.Int64
+
 	// lastAck is the control loop's record of that evidence, per peer. Written
 	// only by the control loop.
 	lastAck map[int]peerAck

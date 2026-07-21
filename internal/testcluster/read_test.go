@@ -283,3 +283,91 @@ func TestFollowerWithoutKnownLeaderRefuses(t *testing.T) {
 		t.Fatal("follower answered a linearizable read without reaching the leader")
 	}
 }
+
+// ---- F22: bounded-staleness reads ----
+
+// The tier exists so a client can trade freshness for latency deliberately —
+// but the bound it names is enforced, not advisory. A node inside the bound
+// answers locally with no round trip; a node outside it refuses even though it
+// holds a perfectly readable value.
+func TestBoundedRead_ServedWhileInContact(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v1", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "v1", 5*time.Second)
+
+	// Every node is in contact, so every node can answer within a generous bound.
+	for _, id := range c.ids() {
+		got, ok, err := c.ReadBounded(c.Nodes[id], "k", 2*time.Second, 2*time.Second)
+		if err != nil {
+			t.Fatalf("node %d refused a bounded read while in contact: %v", id, err)
+		}
+		if !ok || got != "v1" {
+			t.Fatalf("node %d returned %q (found=%v), want v1", id, got, ok)
+		}
+	}
+}
+
+// A partitioned follower serves bounded reads only while its budget lasts, then
+// refuses. This is the behaviour that makes the tier honest: the client's answer
+// is wrong by at most the bound it chose, rather than arbitrarily wrong.
+func TestBoundedRead_RefusedOnceBudgetIsSpent(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v1", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "v1", 5*time.Second)
+
+	follower := c.Nodes[c.Others(leader.ID)[0]]
+	c.Isolate(follower.ID)
+
+	// Immediately after the cut it is still well inside a 1s budget.
+	if _, _, err := c.ReadBounded(follower, "k", time.Second, 2*time.Second); err != nil {
+		t.Fatalf("isolated follower refused a bounded read immediately after the "+
+			"cut, while still inside its budget: %v", err)
+	}
+
+	// Once the budget is spent it must refuse, even though the value is right
+	// there in its state machine.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, err := c.ReadBounded(follower, "k", 300*time.Millisecond, time.Second)
+		if errors.Is(err, engine.ErrTooStale) {
+			t.Logf("refused once the budget was spent: %v", err)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("isolated follower kept serving bounded reads past its budget — the " +
+		"bound is decorative")
+}
+
+// A partitioned LEADER is subject to the same rule. "Ask the leader" must not be
+// a way around the staleness rules.
+func TestBoundedRead_PartitionedLeaderIsAlsoStale(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v1", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "v1", 5*time.Second)
+
+	c.Isolate(leader.ID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, err := c.ReadBounded(leader, "k", 300*time.Millisecond, time.Second)
+		if errors.Is(err, engine.ErrTooStale) || errors.Is(err, engine.ErrNotLeader) {
+			t.Logf("partitioned leader refused a bounded read: %v", err)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("partitioned leader kept serving bounded reads past its budget")
+}

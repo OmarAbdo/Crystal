@@ -914,3 +914,7 @@ func (rn *RaftNode) HandlePreVote(req PreVoteRequest, lastLogState func() (index
 	resp.VoteGranted = candidateUpToDate(req.LastLogTerm, req.LastLogIndex, myLastTerm, myLastIndex)
 	return resp
 }
+
+// NoteContactForTest records contact from a leader. It exists so tests can place
+// a node at a known point on the staleness clock without standing up a cluster.
+func (rn *RaftNode) NoteContactForTest() { rn.noteContact() }

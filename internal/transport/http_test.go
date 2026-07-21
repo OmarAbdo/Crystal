@@ -33,7 +33,8 @@ func (f fakeLeaderChecker) CurrentLeader() int { return f.leaderID }
 // reach a successful read.
 type refusingReader struct{}
 
-func (refusingReader) LinearizableRead(time.Duration) error { return engine.ErrNotLeader }
+func (refusingReader) Read(engine.ReadOptions, time.Duration) error { return engine.ErrNotLeader }
+func (refusingReader) Staleness() time.Duration                     { return 0 }
 
 // nilRPC satisfies rpcHandler; the client-facing tests never reach it.
 type nilRPC struct{}

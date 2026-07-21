@@ -32,6 +32,7 @@ package engine
 
 import (
 	"log"
+	"math"
 	"time"
 
 	"crystal/internal/raft"
@@ -309,6 +310,9 @@ func (e *Engine) checkQuorum() {
 	}
 
 	if reachable > e.node.ClusterSize()/2 {
+		// A majority is reachable right now. Bounded reads measure their freshness
+		// against this instant.
+		e.noteQuorumConfirmed()
 		return
 	}
 
@@ -518,4 +522,114 @@ func (e *Engine) failAllApplyWaiters(err error) {
 		w.resultCh <- err
 	}
 	e.applyWaiters = e.applyWaiters[:0]
+}
+
+// ---- Bounded-staleness reads (F22) ----
+
+// Consistency selects what a read guarantees. The zero value is Linearizable, so
+// a caller that has not thought about consistency gets the safe answer rather
+// than the fast one — the opposite of what a `RequireLinearizable bool` field
+// would have produced, since a bool's zero value is false.
+type Consistency int
+
+const (
+	// Linearizable reads reflect everything committed at the moment the read was
+	// admitted, confirmed against a quorum. Any node can serve one (F21).
+	Linearizable Consistency = iota
+
+	// BoundedStale reads are answered from local state, but only if this node can
+	// prove it has been in contact with a leader within MaxStaleness. A node that
+	// cannot refuses rather than answering.
+	BoundedStale
+)
+
+// ReadOptions is what a client asks for.
+type ReadOptions struct {
+	Consistency Consistency
+
+	// MaxStaleness bounds how out of date the answer may be. Required for
+	// BoundedStale and ignored otherwise.
+	MaxStaleness time.Duration
+}
+
+// Read serves a read under the given options.
+func (e *Engine) Read(opts ReadOptions, timeout time.Duration) error {
+	switch opts.Consistency {
+	case BoundedStale:
+		return e.boundedRead(opts.MaxStaleness, timeout)
+	default:
+		return e.LinearizableRead(timeout)
+	}
+}
+
+// boundedRead answers from local state if this node's knowledge is recent
+// enough, and refuses otherwise.
+//
+// Two conditions, and both are needed:
+//
+//  1. Our contact with a leader is within maxStaleness. This bounds how wrong we
+//     could be, which is the only thing a replica can honestly promise about its
+//     own freshness — it cannot know what it has not been told.
+//
+//  2. We have applied everything we already know to be committed. A node can be
+//     receiving heartbeats happily while its own apply loop lags, which would
+//     pass the first check while serving state it KNOWS is behind. Without this,
+//     the bound quietly does not mean what it says.
+//
+// Note what is absent: any comparison of clocks between machines. Both ends of
+// the staleness interval are measured on this node with a monotonic clock, so
+// unlike a lease read (§8: "this would rely on timing for safety (it assumes
+// bounded clock skew)") this tier assumes nothing about anybody else's clock.
+func (e *Engine) boundedRead(maxStaleness, timeout time.Duration) error {
+	if maxStaleness <= 0 {
+		return ErrMaxStalenessRequired
+	}
+
+	if age := e.staleness(); age > maxStaleness {
+		log.Printf("[ENGINE] refusing bounded read: %v stale, client allows %v",
+			age.Truncate(time.Millisecond), maxStaleness)
+		return ErrTooStale
+	}
+
+	// Condition 2: catch up to what we already know is committed. The wait is
+	// bounded by the read timeout; a node that cannot even apply what it has been
+	// told is committed has no business answering.
+	commitIndex, _ := e.node.CommitAndApplyBoundary()
+	if err := e.awaitApplied(commitIndex, timeout); err != nil {
+		return ErrTooStale
+	}
+	return nil
+}
+
+// staleness reports how long it has been since this node last had confirmation
+// that it was current with a leader.
+//
+//   - Follower or candidate: time since the last valid contact from a leader.
+//   - Leader: time since a majority last confirmed our leadership. A partitioned
+//     leader is just another stale server, and gets no exemption — "ask the
+//     leader" must not be a way around the staleness rules.
+//   - Single-node cluster: always current; there is nobody it could be behind.
+func (e *Engine) staleness() time.Duration {
+	if len(e.peers) == 0 {
+		return 0
+	}
+	if !e.node.IsLeader() {
+		return e.node.TimeSinceContact()
+	}
+	nanos := e.lastQuorumNanos.Load()
+	if nanos == 0 {
+		// Promoted but no round has completed yet: we have confirmed nothing.
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Since(time.Unix(0, nanos))
+}
+
+// Staleness exposes the current staleness for reporting to clients.
+func (e *Engine) Staleness() time.Duration { return e.staleness() }
+
+// noteQuorumConfirmed records that a majority was reachable just now. Called
+// from the control loop; stored atomically because reads are served from RPC
+// goroutines and must not touch control-loop-owned state.
+func (e *Engine) noteQuorumConfirmed() {
+	e.lastQuorumNanos.Store(time.Now().UnixNano())
 }
