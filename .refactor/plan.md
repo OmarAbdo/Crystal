@@ -266,7 +266,35 @@ outnumber writes heavily. Two findings came out of that discussion:
       *Follow-on:* pre-vote is the stronger fix and should be considered after
       this lands; §6's check is the paper's own remedy and comes first.
 
-- [ ] **F16 — no membership changes (§6 joint consensus).** `clusterSize` is
+- [~] **F16 — no membership changes (§6 joint consensus).** *(step 1 of 3 done,
+      `386372b`)*
+
+      **Done — step 1: membership is a `Configuration`, not an integer.**
+      `raft.Configuration{Voters, OldVoters, Learners}` owns every quorum
+      decision: `HasQuorum` requires separate majorities from both memberships
+      when joint, `QuorumIndex` takes the lower frontier of the two. Vote and
+      pre-vote tallies now record *which* servers voted (a count is meaningless
+      under a joint config). `BecomeLeader` rebuilds progress maps for exactly
+      the current membership. The engine's peer set derives from the node's
+      configuration rather than startup config. No behavior change; 12 new tests
+      for the quorum math.
+
+      **Remaining — step 2: configuration entries in the log.** `OpConfig`
+      command; applied **on append, not on commit** (§6: "a server always uses
+      the latest configuration in its log, regardless of whether the entry is
+      committed"), which means the log-append path must notify the node and a
+      truncation must roll the configuration back — so the node needs a
+      configuration *history* keyed by index, not a single value. The
+      configuration must also go into snapshots (§7: "the snapshot also includes
+      the latest configuration in the log as of last included index").
+
+      **Remaining — step 3: the transition itself.** Leader appends `C_old,new`;
+      once it commits, appends `C_new`; once *that* commits, a leader not in
+      `C_new` steps down (§6). Learner catch-up phase before promotion. Admin
+      API to add/remove a server. §6's disruption remedies are already in place
+      (F13 stickiness, F20 pre-vote), which is what makes removed servers safe.
+
+      Original analysis: `clusterSize` is
       fixed at construction from `-peers`. Largest single item in the plan.
       *Sub-item to do now regardless:* `parsePeers`
       ([config.go:69](../internal/config/config.go#L69)) does not reject a peers
