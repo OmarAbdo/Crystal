@@ -36,6 +36,7 @@ func main() {
 
 	// ---- Build the state machine ----
 	stateMachine := store.NewMemoryStateMachine()
+	stateMachine.SetSessionTTL(cfg.SessionTTL)
 	snapshots := store.NewSnapshotManager(cfg.SnapshotPath())
 
 	// ---- Build the Raft node ----

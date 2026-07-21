@@ -54,6 +54,16 @@ type Command struct {
 
 	ClientID string `json:"client_id,omitempty"`
 	Seq      uint64 `json:"seq,omitempty"`
+
+	// Timestamp is unix nanoseconds, stamped by the LEADER when it appends the
+	// entry. It is the state machine's only clock.
+	//
+	// A state machine must be deterministic: every replica applying the same log
+	// must reach the same state. So anything time-dependent — session expiry, for
+	// one — cannot consult the local wall clock, because the replicas would
+	// diverge. Reading the time from the log instead makes "now" a replicated
+	// value that every node agrees on, at every position in the log.
+	Timestamp int64 `json:"ts,omitempty"`
 }
 
 // EncodeCommand serializes a Command into bytes for embedding in a LogEntry.

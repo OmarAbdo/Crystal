@@ -1,7 +1,9 @@
 package store
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"crystal/internal/raft"
 )
@@ -201,5 +203,149 @@ func TestSnapshot_CarriesDataAndSessionsTogether(t *testing.T) {
 	}
 	if got, _ := restored.Get("a"); got != "1" {
 		t.Fatalf("a = %q, want 1 — an out-of-order retransmission was applied", got)
+	}
+}
+
+// ---- F23: session expiry ----
+
+// applyN applies n untagged no-ops carrying ts, to drive the replicated clock
+// and the sweep counter without touching the data.
+func applyN(t *testing.T, m *MemoryStateMachine, n int, ts int64) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if err := m.Apply(i, raft.Command{Op: raft.OpNoop, Timestamp: ts}); err != nil {
+			t.Fatalf("noop apply: %v", err)
+		}
+	}
+}
+
+// The table must not grow forever. A session unused for longer than the TTL is
+// reclaimed on the next sweep.
+func TestSessions_ExpireAfterTTL(t *testing.T) {
+	m := NewMemoryStateMachine()
+	m.SetSessionTTL(time.Minute)
+
+	base := time.Now().UnixNano()
+	if err := m.Apply(1, raft.Command{Op: raft.OpSet, Key: "k", Value: "v",
+		ClientID: "c1", Seq: 1, Timestamp: base}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if m.SessionCount() != 1 {
+		t.Fatalf("SessionCount = %d, want 1", m.SessionCount())
+	}
+
+	// Drive the clock two minutes forward, far enough to trigger a sweep.
+	applyN(t, m, sweepInterval, base+int64(2*time.Minute))
+
+	if got := m.SessionCount(); got != 0 {
+		t.Fatalf("SessionCount = %d, want 0 — an unused session was not reclaimed "+
+			"and the table grows without bound", got)
+	}
+}
+
+// A session still inside its TTL survives a sweep.
+func TestSessions_ActiveSessionSurvivesSweep(t *testing.T) {
+	m := NewMemoryStateMachine()
+	m.SetSessionTTL(time.Hour)
+
+	base := time.Now().UnixNano()
+	if err := m.Apply(1, raft.Command{Op: raft.OpSet, Key: "k", Value: "v",
+		ClientID: "c1", Seq: 1, Timestamp: base}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	applyN(t, m, sweepInterval, base+int64(time.Minute))
+
+	if got := m.SessionCount(); got != 1 {
+		t.Fatalf("SessionCount = %d, want 1 — an in-TTL session was reclaimed", got)
+	}
+	// And it is still deduplicating.
+	if err := m.Apply(2, raft.Command{Op: raft.OpSet, Key: "k", Value: "changed",
+		ClientID: "c1", Seq: 1, Timestamp: base + int64(time.Minute)}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if got, _ := m.Get("k"); got != "v" {
+		t.Fatalf("k = %q, want v — a surviving session stopped deduplicating", got)
+	}
+}
+
+// The clock is the LOG's, not the machine's. Expiry must be driven by
+// Command.Timestamp, so replicas applying the same log expire the same sessions
+// at the same positions. A sweep with no clock movement must reclaim nothing,
+// however much local time has passed.
+func TestSessions_ExpiryIgnoresLocalTime(t *testing.T) {
+	m := NewMemoryStateMachine()
+	m.SetSessionTTL(time.Nanosecond) // absurdly short in local terms
+
+	base := int64(1_000_000)
+	if err := m.Apply(1, raft.Command{Op: raft.OpSet, Key: "k", Value: "v",
+		ClientID: "c1", Seq: 1, Timestamp: base}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// Real time passes, but the log's clock does not move.
+	time.Sleep(10 * time.Millisecond)
+	applyN(t, m, sweepInterval, base)
+
+	if got := m.SessionCount(); got != 1 {
+		t.Fatalf("SessionCount = %d, want 1 — expiry consulted local time instead "+
+			"of the replicated clock, which would make replicas diverge", got)
+	}
+}
+
+// A leader whose wall clock jumps backwards must not rewind the state machine's
+// clock, which would resurrect sessions that were already reclaimable.
+func TestSessions_ClockIsMonotonic(t *testing.T) {
+	m := NewMemoryStateMachine()
+	base := time.Now().UnixNano()
+
+	if err := m.Apply(1, raft.Command{Op: raft.OpNoop, Timestamp: base}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// A command stamped in the past, e.g. by a new leader with a skewed clock.
+	if err := m.Apply(2, raft.Command{Op: raft.OpSet, Key: "k", Value: "v",
+		ClientID: "c1", Seq: 1, Timestamp: base - int64(time.Hour)}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// The session must be stamped with the monotonic clock, not the stale
+	// timestamp, or it would look an hour old the instant it was created.
+	m.SetSessionTTL(time.Minute)
+	applyN(t, m, sweepInterval, base)
+	if got := m.SessionCount(); got != 1 {
+		t.Fatalf("SessionCount = %d, want 1 — a backwards clock aged a session "+
+			"that had just been created", got)
+	}
+}
+
+// Expiry state rides in the snapshot: a restored node must sweep at the same log
+// positions as its peers, or the replicas diverge.
+func TestSessions_ExpiryStateSurvivesSnapshot(t *testing.T) {
+	m := NewMemoryStateMachine()
+	base := time.Now().UnixNano()
+	applyN(t, m, 10, base)
+
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	restored := NewMemoryStateMachine()
+	if err := restored.Restore(snap); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	var st machineState
+	if err := json.Unmarshal(snap, &st); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if st.Now != base {
+		t.Fatalf("snapshot Now = %d, want %d — the replicated clock was not saved",
+			st.Now, base)
+	}
+	if st.AppliesSinceSweep != 10 {
+		t.Fatalf("snapshot AppliesSinceSweep = %d, want 10 — sweep progress was "+
+			"not saved, so a restored node sweeps out of step with its peers",
+			st.AppliesSinceSweep)
 	}
 }

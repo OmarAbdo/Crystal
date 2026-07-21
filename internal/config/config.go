@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for a CrystalDB node.
@@ -19,6 +20,14 @@ type Config struct {
 	// truncation. 0 means "use the RaftLog default" (1000). Exposed mainly so
 	// integration tests can force compaction with a small log.
 	CompactionThreshold int
+
+	// SessionTTL is how long an unused client session survives before the state
+	// machine reclaims it (F23). 0 means the store default.
+	//
+	// EVERY NODE MUST BE CONFIGURED IDENTICALLY. This value is part of the
+	// replicated decision procedure: nodes that disagree about when a session
+	// expires will apply the same log and reach different states.
+	SessionTTL time.Duration
 }
 
 // WALPath returns the full path to this node's WAL file.
@@ -43,6 +52,8 @@ func ParseFlags() (*Config, error) {
 	dataDirFlag := flag.String("data-dir", "data", "Directory for WAL, metadata, and snapshot files")
 	peersFlag := flag.String("peers", "", "Comma-separated peer list: id:host:port,id:host:port")
 	compactionFlag := flag.Int("compaction-threshold", 0, "Log size that triggers compaction (0 = default 1000)")
+	sessionTTLFlag := flag.Duration("session-ttl", 0,
+		"How long an unused client session survives (0 = default 1h). Must be identical on every node.")
 
 	flag.Parse()
 
@@ -52,6 +63,7 @@ func ParseFlags() (*Config, error) {
 		DataDir:             *dataDirFlag,
 		Peers:               make(map[int]string),
 		CompactionThreshold: *compactionFlag,
+		SessionTTL:          *sessionTTLFlag,
 	}
 
 	if err := parsePeers(*peersFlag, cfg.Peers); err != nil {

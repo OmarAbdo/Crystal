@@ -285,7 +285,12 @@ func (e *Engine) handleProposal(prop Proposal) {
 		return
 	}
 
-	cmdBytes, err := raft.EncodeCommand(prop.Command)
+	// Stamp the command with the leader's clock. This is the state machine's only
+	// notion of time — see raft.Command.Timestamp for why it cannot use its own.
+	cmd := prop.Command
+	cmd.Timestamp = time.Now().UnixNano()
+
+	cmdBytes, err := raft.EncodeCommand(cmd)
 	if err != nil {
 		prop.ResultCh <- err
 		return
@@ -795,7 +800,10 @@ func (e *Engine) becomeLeader(electionTerm, lastLogIndex int) {
 	// is also the floor for reads: until it commits, this leader does not know
 	// the true commit frontier and must not answer a read.
 	e.noopIndex = 0
-	if noop, err := raft.EncodeCommand(raft.Command{Op: raft.OpNoop}); err != nil {
+	if noop, err := raft.EncodeCommand(raft.Command{
+		Op:        raft.OpNoop,
+		Timestamp: time.Now().UnixNano(),
+	}); err != nil {
 		log.Printf("[ENGINE] Failed to encode leader no-op: %v", err)
 	} else if entry, err := e.raftLog.AppendLeader(noop, electionTerm); err != nil {
 		log.Printf("[ENGINE] Failed to append leader no-op: %v", err)
