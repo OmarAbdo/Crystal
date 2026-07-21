@@ -56,13 +56,25 @@ func newLeaderEngineSized(t *testing.T, term, size int) (*Engine, *raft.RaftNode
 	return e, node
 }
 
-// assertPending fails if a result channel has already been resolved.
-func assertPending(t *testing.T, ch chan error, msg string) {
+// assertPending fails if a read has already been resolved.
+func assertPending(t *testing.T, ch chan readResult, msg string) {
 	t.Helper()
 	select {
 	case v := <-ch:
-		t.Fatalf("%s (got %v)", msg, v)
+		t.Fatalf("%s (got %+v)", msg, v)
 	default:
+	}
+}
+
+// recvRead reads one resolved read result that must already be ready.
+func recvRead(t *testing.T, ch chan readResult) readResult {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	default:
+		t.Fatalf("expected a value on the read channel, none present")
+		return readResult{}
 	}
 }
 
@@ -83,8 +95,8 @@ func TestReadIndex_IgnoresAcksFromRoundsStartedBeforeTheRead(t *testing.T) {
 	// A round is already in flight when the read arrives.
 	staleSeq := e.nextRoundSeq()
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 	assertPending(t, ch, "read released before any quorum evidence")
 
 	// Its reply lands now. The ack is newer than the read; the EVIDENCE is not.
@@ -93,8 +105,8 @@ func TestReadIndex_IgnoresAcksFromRoundsStartedBeforeTheRead(t *testing.T) {
 
 	// A round begun after the read is admissible.
 	e.handleAck(ackReport{peerID: 2, startSeq: e.nextRoundSeq()})
-	if err := recvNoBlock(t, ch); err != nil {
-		t.Fatalf("read failed on valid post-read evidence: %v", err)
+	if r := recvRead(t, ch); r.err != nil {
+		t.Fatalf("read failed on valid post-read evidence: %v", r.err)
 	}
 }
 
@@ -108,16 +120,16 @@ func TestReadIndex_WaitsForTheTermNoopToCommit(t *testing.T) {
 	node.LastApplied = 5
 	e.noopIndex = 9 // appended on election, not yet committed
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 	e.handleAck(ackReport{peerID: 2, startSeq: e.nextRoundSeq()})
 	assertPending(t, ch, "read released before the term's no-op committed")
 
 	node.CommitIndex = 9
 	node.LastApplied = 9
 	e.handleAck(ackReport{peerID: 2, startSeq: e.nextRoundSeq()})
-	if err := recvNoBlock(t, ch); err != nil {
-		t.Fatalf("read failed after the no-op committed: %v", err)
+	if r := recvRead(t, ch); r.err != nil {
+		t.Fatalf("read failed after the no-op committed: %v", r.err)
 	}
 }
 
@@ -129,15 +141,15 @@ func TestReadIndex_WaitsForStateMachineToCatchUp(t *testing.T) {
 	node.CommitIndex = 8
 	node.LastApplied = 3 // committed, not yet applied
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 	e.handleAck(ackReport{peerID: 2, startSeq: e.nextRoundSeq()})
 	assertPending(t, ch, "read released while the state machine lagged the read index")
 
 	node.LastApplied = 8
 	e.handleAck(ackReport{peerID: 2, startSeq: e.nextRoundSeq()})
-	if err := recvNoBlock(t, ch); err != nil {
-		t.Fatalf("read failed once applied caught up: %v", err)
+	if r := recvRead(t, ch); r.err != nil {
+		t.Fatalf("read failed once applied caught up: %v", r.err)
 	}
 }
 
@@ -146,8 +158,8 @@ func TestReadIndex_RequiresAMajority(t *testing.T) {
 	node.CommitIndex = 5
 	node.LastApplied = 5
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 
 	// Self + 1 = 2 of 5. Not a majority.
 	e.handleAck(ackReport{peerID: 2, startSeq: e.nextRoundSeq()})
@@ -155,8 +167,8 @@ func TestReadIndex_RequiresAMajority(t *testing.T) {
 
 	// Self + 2 = 3 of 5.
 	e.handleAck(ackReport{peerID: 3, startSeq: e.nextRoundSeq()})
-	if err := recvNoBlock(t, ch); err != nil {
-		t.Fatalf("read failed with a genuine majority: %v", err)
+	if r := recvRead(t, ch); r.err != nil {
+		t.Fatalf("read failed with a genuine majority: %v", r.err)
 	}
 }
 
@@ -168,8 +180,8 @@ func TestReadIndex_FailsOnTermChange(t *testing.T) {
 	node.CommitIndex = 5
 	node.LastApplied = 5
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 	assertPending(t, ch, "read released immediately")
 
 	if err := node.BecomeFollower(9, 2); err != nil {
@@ -177,8 +189,8 @@ func TestReadIndex_FailsOnTermChange(t *testing.T) {
 	}
 	e.fireReadWaiters()
 
-	if err := recvNoBlock(t, ch); err != ErrNotLeader {
-		t.Fatalf("read got %v, want ErrNotLeader after being deposed", err)
+	if r := recvRead(t, ch); r.err != ErrNotLeader {
+		t.Fatalf("read got %v, want ErrNotLeader after being deposed", r.err)
 	}
 }
 
@@ -189,14 +201,14 @@ func TestReadIndex_TimesOutRatherThanServingStale(t *testing.T) {
 	node.CommitIndex = 5
 	node.LastApplied = 5
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 
 	// No acks ever arrive — we are partitioned.
 	e.sweepExpiredReads(time.Now().Add(readTimeout + time.Second))
 
-	if err := recvNoBlock(t, ch); err != ErrReadTimeout {
-		t.Fatalf("read got %v, want ErrReadTimeout", err)
+	if r := recvRead(t, ch); r.err != ErrReadTimeout {
+		t.Fatalf("read got %v, want ErrReadTimeout", r.err)
 	}
 }
 
@@ -206,11 +218,11 @@ func TestReadIndex_SingleNodeClusterServesImmediately(t *testing.T) {
 	node.CommitIndex = 5
 	node.LastApplied = 5
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 
-	if err := recvNoBlock(t, ch); err != nil {
-		t.Fatalf("single-node read got %v, want nil", err)
+	if r := recvRead(t, ch); r.err != nil {
+		t.Fatalf("single-node read got %v, want nil", r.err)
 	}
 }
 
@@ -257,15 +269,15 @@ func TestCheckQuorum_FailsPendingReadsOnStepdown(t *testing.T) {
 	node.CommitIndex = 5
 	node.LastApplied = 5
 
-	ch := make(chan error, 1)
-	e.handleRead(Read{ResultCh: ch})
+	ch := make(chan readResult, 1)
+	e.handleRead(Read{ResultCh: ch, awaitApply: true})
 
 	stale := time.Now().Add(-2 * quorumGrace)
 	e.lastAck = map[int]peerAck{2: {at: stale}, 3: {at: stale}}
 	e.checkQuorum()
 
-	if err := recvNoBlock(t, ch); err != ErrNotLeader {
-		t.Fatalf("pending read got %v, want ErrNotLeader", err)
+	if r := recvRead(t, ch); r.err != ErrNotLeader {
+		t.Fatalf("pending read got %v, want ErrNotLeader", r.err)
 	}
 }
 

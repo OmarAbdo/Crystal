@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"crystal/internal/engine"
 	"crystal/internal/raft"
@@ -28,6 +29,12 @@ func (f fakeLeaderChecker) IsLeader() bool     { return f.isLeader }
 func (f fakeLeaderChecker) NodeID() int        { return f.nodeID }
 func (f fakeLeaderChecker) CurrentLeader() int { return f.leaderID }
 
+// refusingReader stands in for the engine in the redirect tests, which never
+// reach a successful read.
+type refusingReader struct{}
+
+func (refusingReader) LinearizableRead(time.Duration) error { return engine.ErrNotLeader }
+
 // nilRPC satisfies rpcHandler; the client-facing tests never reach it.
 type nilRPC struct{}
 
@@ -36,6 +43,9 @@ func (nilRPC) HandleAppendEntries(raft.AppendEntriesRequest) raft.AppendEntriesR
 }
 func (nilRPC) HandlePreVote(raft.PreVoteRequest) raft.PreVoteResponse {
 	return raft.PreVoteResponse{}
+}
+func (nilRPC) HandleReadIndex(raft.ReadIndexRequest) raft.ReadIndexResponse {
+	return raft.ReadIndexResponse{}
 }
 func (nilRPC) HandleRequestVote(raft.RequestVoteRequest) raft.RequestVoteResponse {
 	return raft.RequestVoteResponse{}
@@ -46,7 +56,7 @@ func (nilRPC) HandleInstallSnapshot(raft.InstallSnapshotRequest) raft.InstallSna
 
 func newTestServer(t *testing.T, node leaderChecker, peers map[int]string) *Server {
 	t.Helper()
-	return NewServer(node, make(chan engine.Proposal, 1), make(chan engine.Read, 1),
+	return NewServer(node, make(chan engine.Proposal, 1), refusingReader{},
 		store.NewMemoryStateMachine(), nilRPC{}, peers)
 }
 

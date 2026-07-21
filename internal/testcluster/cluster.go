@@ -294,24 +294,11 @@ func (c *Cluster) SetVia(n *Node, key, value string, timeout time.Duration) erro
 // handler does: ask the engine to establish that a local read is safe, then read.
 func (c *Cluster) Read(n *Node, key string, timeout time.Duration) (string, bool, error) {
 	c.t.Helper()
-	resultCh := make(chan error, 1)
-
-	select {
-	case n.Engine.ReadQueue() <- engine.Read{ResultCh: resultCh}:
-	case <-time.After(timeout):
-		return "", false, fmt.Errorf("node %d: read queue full", n.ID)
+	if err := n.Engine.LinearizableRead(timeout); err != nil {
+		return "", false, err
 	}
-
-	select {
-	case err := <-resultCh:
-		if err != nil {
-			return "", false, err
-		}
-		v, ok := n.Store.Get(key)
-		return v, ok, nil
-	case <-time.After(timeout):
-		return "", false, fmt.Errorf("node %d: read timed out", n.ID)
-	}
+	v, ok := n.Store.Get(key)
+	return v, ok, nil
 }
 
 // Isolate severs a node from the rest of the cluster in both directions. The

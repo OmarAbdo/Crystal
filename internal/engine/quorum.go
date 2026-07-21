@@ -51,11 +51,22 @@ const (
 	quorumGrace = electionTimeoutMax
 )
 
-// Read is a client's linearizable read request. It carries no key: the engine's
-// job is only to establish that a local read is safe NOW, after which the caller
-// reads the state machine directly.
+// Read asks the leader to establish a read index. It carries no key: consensus
+// only has to say WHEN a local read is safe, never what it returns.
 type Read struct {
-	ResultCh chan error // nil = the local state machine may now be read
+	ResultCh chan readResult
+
+	// awaitApply is true when the requester will serve the read from THIS node's
+	// state machine, false when the index is being handed to a follower that does
+	// its own applying.
+	awaitApply bool
+}
+
+// readResult is what a resolved read reports: the confirmed index, or why it
+// could not be confirmed.
+type readResult struct {
+	index int
+	err   error
 }
 
 // ackReport is a replicator telling the control loop that a peer acknowledged
@@ -71,17 +82,164 @@ type peerAck struct {
 	at       time.Time // when the ack was recorded, for CheckQuorum
 }
 
-// readWaiter is a read held until leadership has been confirmed.
+// readWaiter is a read index held until leadership has been confirmed.
+//
+// awaitApply distinguishes the two consumers of one mechanism. A read this node
+// will SERVE must also wait for its own state machine to reach the index. A read
+// index being handed to a FOLLOWER over the ReadIndex RPC must not: the follower
+// does its own applying, and making the leader wait for state it will never read
+// would add latency for nothing.
 type readWaiter struct {
-	readIndex int       // state machine must have applied at least this far
-	term      int       // leader term the read was admitted under
-	barrier   uint64    // only rounds started after this count as evidence
-	deadline  time.Time
-	resultCh  chan error
+	readIndex  int
+	term       int    // leader term the read was admitted under
+	barrier    uint64 // only rounds started after this count as evidence
+	awaitApply bool
+	deadline   time.Time
+	resultCh   chan readResult
 }
 
-// ReadQueue returns the channel callers use to submit linearizable reads.
-func (e *Engine) ReadQueue() chan<- Read { return e.readCh }
+// applyWaiter blocks until this node's state machine has applied through index.
+// It is how a FOLLOWER waits after the leader has handed it a read index. No term
+// or quorum condition applies: the leader already made that decision, and a
+// replica only ever applies entries that were committed by a quorum.
+type applyWaiter struct {
+	index    int
+	deadline time.Time
+	resultCh chan error
+}
+
+// ---- Public entry points ----
+
+// LinearizableRead blocks until it is safe for THIS node to answer a read from
+// its own state machine, wherever it sits in the cluster.
+//
+//   - Leader: admit a read index, confirm leadership with a quorum round, wait
+//     for local apply.
+//   - Follower: ask the leader for a confirmed read index, then wait for local
+//     apply.
+//
+// The follower path is the point of the exercise. Only an integer crosses the
+// network; the state machine access, the lookup and the response body all stay
+// local. Read throughput therefore scales with the number of replicas instead of
+// being pinned to whatever one machine can serve, which is the shape a
+// coordination store actually needs — reads outnumber writes heavily.
+//
+// The leader's share drops to one small RPC per read, and because pending reads
+// share a quorum round, its confirmation cost is per-round rather than per-read.
+//
+// The trade is latency: a follower read costs a round trip to the leader that a
+// local read would not. Throughput and leader offload are bought with per-request
+// latency, deliberately.
+func (e *Engine) LinearizableRead(timeout time.Duration) error {
+	if e.node.IsLeader() {
+		return e.leaderRead(timeout)
+	}
+	return e.followerRead(timeout)
+}
+
+// leaderRead is the leader serving its own read.
+func (e *Engine) leaderRead(timeout time.Duration) error {
+	resultCh := make(chan readResult, 1)
+	select {
+	case e.readCh <- Read{ResultCh: resultCh, awaitApply: true}:
+	case <-time.After(timeout):
+		return ErrReadTimeout
+	case <-e.done:
+		return ErrNotLeader
+	}
+
+	select {
+	case r := <-resultCh:
+		return r.err
+	case <-time.After(timeout):
+		return ErrReadTimeout
+	}
+}
+
+// followerRead fetches a read index from the leader, then waits for this node's
+// own state machine to reach it.
+func (e *Engine) followerRead(timeout time.Duration) error {
+	leaderID := e.node.CurrentLeader()
+	if leaderID == 0 {
+		return ErrNotLeader // no leader known; the client should retry
+	}
+	addr, ok := e.peers[leaderID]
+	if !ok {
+		return ErrNotLeader // leader outside our peer map; nothing we can do
+	}
+
+	resp, ok := e.replicator.ReadIndexFrom(addr, raft.ReadIndexRequest{
+		FromNodeID: e.node.NodeID(),
+	})
+	if !ok || !resp.Success {
+		// The leader is unreachable, has been deposed, or could not confirm its
+		// own quorum. Refusing is correct — answering from local state here is
+		// precisely the stale read this whole path exists to prevent.
+		return ErrNotLeader
+	}
+
+	return e.awaitApplied(resp.ReadIndex, timeout)
+}
+
+// awaitApplied blocks until the local state machine has applied through index.
+func (e *Engine) awaitApplied(index int, timeout time.Duration) error {
+	// Fast path: already caught up, so no trip through the control loop. This is
+	// the common case on a healthy follower, where replication has usually
+	// outrun the read that is asking about it.
+	if _, applied := e.node.CommitAndApplyBoundary(); applied >= index {
+		return nil
+	}
+
+	resultCh := make(chan error, 1)
+	select {
+	case e.applyCh <- applyWaiter{
+		index:    index,
+		deadline: time.Now().Add(timeout),
+		resultCh: resultCh,
+	}:
+	case <-time.After(timeout):
+		return ErrReadTimeout
+	case <-e.done:
+		return ErrReadTimeout
+	}
+
+	select {
+	case err := <-resultCh:
+		return err
+	case <-time.After(timeout):
+		return ErrReadTimeout
+	}
+}
+
+// HandleReadIndex answers a follower asking for a read index — the receiving half
+// of the ReadIndex RPC. It runs on an RPC goroutine and hands the decision to the
+// control loop, which owns it.
+func (e *Engine) HandleReadIndex(req raft.ReadIndexRequest) raft.ReadIndexResponse {
+	resultCh := make(chan readResult, 1)
+	select {
+	// awaitApply is false: the follower does its own applying, so blocking here
+	// on the leader's apply progress would add latency for state we never read.
+	case e.readCh <- Read{ResultCh: resultCh, awaitApply: false}:
+	case <-time.After(readTimeout):
+		return raft.ReadIndexResponse{Term: e.node.CurrentTerm()}
+	case <-e.done:
+		return raft.ReadIndexResponse{Term: e.node.CurrentTerm()}
+	}
+
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			return raft.ReadIndexResponse{Term: e.node.CurrentTerm()}
+		}
+		return raft.ReadIndexResponse{
+			Term:      e.node.CurrentTerm(),
+			ReadIndex: r.index,
+			Success:   true,
+		}
+	case <-time.After(readTimeout):
+		return raft.ReadIndexResponse{Term: e.node.CurrentTerm()}
+	}
+}
 
 // nextRoundSeq claims a round number. Called by replicator goroutines before
 // they send, hence atomic.
@@ -192,7 +350,7 @@ func (e *Engine) checkQuorum() {
 func (e *Engine) handleRead(r Read) {
 	role, term := e.node.State()
 	if role != raft.Leader {
-		r.ResultCh <- ErrNotLeader
+		r.ResultCh <- readResult{err: ErrNotLeader}
 		return
 	}
 
@@ -209,9 +367,10 @@ func (e *Engine) handleRead(r Read) {
 		term:      term,
 		// Only rounds started from now on count. Anything already in flight
 		// carries a follower assertion older than this read.
-		barrier:  e.roundSeq.Load(),
-		deadline: time.Now().Add(readTimeout),
-		resultCh: r.ResultCh,
+		barrier:    e.roundSeq.Load(),
+		awaitApply: r.awaitApply,
+		deadline:   time.Now().Add(readTimeout),
+		resultCh:   r.ResultCh,
 	}
 	e.reads = append(e.reads, w)
 
@@ -234,9 +393,11 @@ func (e *Engine) readSatisfied(w *readWaiter, role raft.NodeRole, term int, comm
 		return false
 	}
 
-	// The state machine must actually contain everything up to the read index,
-	// or a local read could miss a write the read index promises.
-	if lastApplied < w.readIndex {
+	// The state machine must actually contain everything up to the read index, or
+	// a local read could miss a write the read index promises. Required only when
+	// THIS node will serve the read; a follower does its own applying, and making
+	// the leader wait for state it will never read would add latency for nothing.
+	if w.awaitApply && lastApplied < w.readIndex {
 		return false
 	}
 
@@ -269,9 +430,9 @@ func (e *Engine) fireReadWaiters() {
 			// We are no longer the leader that admitted this read. Refuse; do not
 			// fall back to a local read, which is exactly the stale answer the
 			// mechanism exists to prevent.
-			w.resultCh <- ErrNotLeader
+			w.resultCh <- readResult{err: ErrNotLeader}
 		case e.readSatisfied(w, role, term, commitIndex, lastApplied):
-			w.resultCh <- nil
+			w.resultCh <- readResult{index: w.readIndex}
 		default:
 			kept = append(kept, w)
 		}
@@ -287,7 +448,7 @@ func (e *Engine) sweepExpiredReads(now time.Time) {
 	kept := e.reads[:0]
 	for _, w := range e.reads {
 		if now.After(w.deadline) {
-			w.resultCh <- ErrReadTimeout
+			w.resultCh <- readResult{err: ErrReadTimeout}
 		} else {
 			kept = append(kept, w)
 		}
@@ -298,7 +459,63 @@ func (e *Engine) sweepExpiredReads(now time.Time) {
 // failAllReads resolves every pending read with err.
 func (e *Engine) failAllReads(err error) {
 	for _, w := range e.reads {
-		w.resultCh <- err
+		w.resultCh <- readResult{err: err}
 	}
 	e.reads = e.reads[:0]
+}
+
+// ---- Apply waiters: the follower half of a linearizable read ----
+
+// handleApplyWait registers a waiter, or resolves it at once if this node has
+// already applied far enough. Control loop only.
+func (e *Engine) handleApplyWait(w applyWaiter) {
+	if _, applied := e.node.CommitAndApplyBoundary(); applied >= w.index {
+		w.resultCh <- nil
+		return
+	}
+	e.applyWaiters = append(e.applyWaiters, w)
+}
+
+// fireApplyWaiters releases waiters whose index this node has now applied.
+func (e *Engine) fireApplyWaiters() {
+	if len(e.applyWaiters) == 0 {
+		return
+	}
+	_, applied := e.node.CommitAndApplyBoundary()
+
+	kept := e.applyWaiters[:0]
+	for _, w := range e.applyWaiters {
+		if applied >= w.index {
+			w.resultCh <- nil
+		} else {
+			kept = append(kept, w)
+		}
+	}
+	e.applyWaiters = kept
+}
+
+// sweepExpiredApplyWaiters fails waiters whose node never caught up — typically
+// because it has been partitioned away from the leader shipping the entries.
+// Refusing is correct: the read index is a promise about what the answer will
+// contain, and we cannot keep it.
+func (e *Engine) sweepExpiredApplyWaiters(now time.Time) {
+	if len(e.applyWaiters) == 0 {
+		return
+	}
+	kept := e.applyWaiters[:0]
+	for _, w := range e.applyWaiters {
+		if now.After(w.deadline) {
+			w.resultCh <- ErrReadTimeout
+		} else {
+			kept = append(kept, w)
+		}
+	}
+	e.applyWaiters = kept
+}
+
+func (e *Engine) failAllApplyWaiters(err error) {
+	for _, w := range e.applyWaiters {
+		w.resultCh <- err
+	}
+	e.applyWaiters = e.applyWaiters[:0]
 }

@@ -32,6 +32,10 @@ type Transport interface {
 	PreVote(addr string, req PreVoteRequest) (PreVoteResponse, error)
 	RequestVote(addr string, req RequestVoteRequest) (RequestVoteResponse, error)
 	InstallSnapshot(addr string, req InstallSnapshotRequest) (InstallSnapshotResponse, error)
+
+	// ReadIndex asks the leader at addr for a quorum-confirmed read index, so
+	// that this node can serve a linearizable read from its own state machine.
+	ReadIndex(addr string, req ReadIndexRequest) (ReadIndexResponse, error)
 }
 
 // HTTPTransport is the production Transport: one JSON POST per RPC.
@@ -56,6 +60,10 @@ func (t *HTTPTransport) PreVote(addr string, req PreVoteRequest) (PreVoteRespons
 
 func (t *HTTPTransport) RequestVote(addr string, req RequestVoteRequest) (RequestVoteResponse, error) {
 	return postJSON[RequestVoteRequest, RequestVoteResponse](t.client, addr, "internal/vote", req)
+}
+
+func (t *HTTPTransport) ReadIndex(addr string, req ReadIndexRequest) (ReadIndexResponse, error) {
+	return postJSON[ReadIndexRequest, ReadIndexResponse](t.client, addr, "internal/readindex", req)
 }
 
 func (t *HTTPTransport) InstallSnapshot(addr string, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {

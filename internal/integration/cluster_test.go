@@ -139,12 +139,15 @@ func trySet(addr, key, value string) (int, error) {
 // followers correctly refuse it, so using the default here would test the read
 // contract rather than replication.
 //
-// tryGetLinearizable covers the default contract separately.
+// tryGetLinearizable covers the default contract separately — and since F21 that
+// contract is served by followers too, so the distinction here is genuinely
+// about consistency rather than about which node you happen to ask.
 func tryGet(addr, key string) (string, int, error) {
 	return doGet(addr, key, "stale")
 }
 
-// tryGetLinearizable uses the default read path: leader-only, quorum-confirmed.
+// tryGetLinearizable uses the default read path: quorum-confirmed, and servable
+// by any node (a follower fetches a read index from the leader first).
 func tryGetLinearizable(addr, key string) (string, int, error) {
 	return doGet(addr, key, "linearizable")
 }
@@ -431,7 +434,9 @@ func TestLinearizableReadContract(t *testing.T) {
 		t.Fatalf("leader returned %q, want the committed value", body)
 	}
 
-	// Followers refuse it, and say where to go instead.
+	// And so does every FOLLOWER — that is F21. A follower fetches a confirmed
+	// read index from the leader and answers from its own state machine, so read
+	// capacity scales with the cluster instead of being pinned to one node.
 	for _, nd := range nodes {
 		if nd.id == leader.id {
 			continue
@@ -440,18 +445,48 @@ func TestLinearizableReadContract(t *testing.T) {
 		if err != nil {
 			t.Fatalf("node %d: %v", nd.id, err)
 		}
-		if code != http.StatusMisdirectedRequest {
-			t.Fatalf("follower %d answered a linearizable read: code=%d body=%q — "+
-				"only the leader can establish that a read is current",
+		if code != http.StatusOK {
+			t.Fatalf("follower %d refused a linearizable read: code=%d body=%q",
 				nd.id, code, body)
 		}
-		if !bytes.Contains([]byte(body), []byte("leader")) {
-			t.Fatalf("follower %d refused without naming the leader: %q", nd.id, body)
+		if !bytes.Contains([]byte(body), []byte("yes")) {
+			t.Fatalf("follower %d returned %q, want the committed value", nd.id, body)
 		}
 
-		// The same node still answers a stale read: opting out is explicit.
+		// The explicit stale read still works too.
 		if _, code, _ := tryGet(nd.addr(), "lin"); code != http.StatusOK {
 			t.Fatalf("follower %d refused an explicit stale read: code=%d", nd.id, code)
+		}
+	}
+}
+
+// A read served by a follower must observe a write the leader has already
+// acknowledged. Over real HTTP, so the ReadIndex RPC and the apply wait are both
+// exercised end to end rather than in-process.
+func TestFollowerLinearizableReadIsCurrent(t *testing.T) {
+	bin := buildBinary(t)
+	nodes := startCluster(t, bin, 3)
+
+	leader := findLeader(t, nodes, "seed", "0", 8*time.Second)
+	var follower *node
+	for _, nd := range nodes {
+		if nd.id != leader.id {
+			follower = nd
+			break
+		}
+	}
+
+	for i, v := range []string{"a", "b", "c"} {
+		if code, err := trySet(leader.addr(), "k", v); err != nil || code != http.StatusOK {
+			t.Fatalf("write %d: code=%d err=%v", i, code, err)
+		}
+		body, code, err := tryGetLinearizable(follower.addr(), "k")
+		if err != nil || code != http.StatusOK {
+			t.Fatalf("follower read %d: code=%d err=%v body=%q", i, code, err, body)
+		}
+		if !bytes.Contains([]byte(body), []byte(v)) {
+			t.Fatalf("follower read %d returned %q, want %q — a linearizable read "+
+				"missed an acknowledged write", i, body, v)
 		}
 	}
 }

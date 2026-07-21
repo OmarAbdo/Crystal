@@ -125,9 +125,16 @@ type Engine struct {
 	// only by the control loop.
 	lastAck map[int]peerAck
 
-	// reads are pending linearizable reads, and readCh is how they arrive.
+	// reads are pending read-index requests (from this node or from a follower
+	// over the ReadIndex RPC), and readCh is how they arrive.
 	reads  []*readWaiter
 	readCh chan Read
+
+	// applyWaiters are reads on THIS node waiting for its state machine to reach
+	// an index the leader already confirmed. This is the follower half of a
+	// linearizable read; it carries no term or quorum condition.
+	applyWaiters []applyWaiter
+	applyCh      chan applyWaiter
 
 	// noopIndex is the index of the no-op this leader appended on election. Until
 	// it commits, the leader does not yet know the true commit frontier (§8), so
@@ -190,6 +197,7 @@ func NewWithTransport(
 		ackCh:        make(chan ackReport, 4*(len(cfg.Peers)+1)),
 		lastAck:      make(map[int]peerAck, len(cfg.Peers)),
 		readCh:       make(chan Read, 100),
+		applyCh:      make(chan applyWaiter, 100),
 		done:         make(chan struct{}),
 		fatalf:       log.Fatalf,
 	}
@@ -231,6 +239,7 @@ func (e *Engine) Run(done <-chan struct{}) {
 		case <-done:
 			e.failAllWaiters(ErrNotLeader)
 			e.failAllReads(ErrNotLeader)
+			e.failAllApplyWaiters(ErrReadTimeout)
 			return
 
 		case prop := <-e.proposals:
@@ -250,6 +259,9 @@ func (e *Engine) Run(done <-chan struct{}) {
 
 		case r := <-e.readCh:
 			e.handleRead(r)
+
+		case w := <-e.applyCh:
+			e.handleApplyWait(w)
 
 		case <-ticker.C:
 			e.onTick()
@@ -379,8 +391,10 @@ func (e *Engine) onTick() {
 	e.maybeCompact()
 
 	// Reads depend on applied progress and on leadership evidence, both of which
-	// may have moved above.
+	// may have moved above. Apply waiters are fired on every node, not just the
+	// leader: a follower serving a linearizable read is waiting here.
 	e.fireReadWaiters()
+	e.fireApplyWaiters()
 
 	// CheckQuorum runs after the read pass so a leader that is about to step down
 	// still gets one chance to satisfy reads it can legitimately serve.
@@ -391,6 +405,7 @@ func (e *Engine) onTick() {
 	now := time.Now()
 	e.sweepExpiredWaiters(now)
 	e.sweepExpiredReads(now)
+	e.sweepExpiredApplyWaiters(now)
 }
 
 // reconcileLeadership makes the control loop's view of leadership agree with the

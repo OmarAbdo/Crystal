@@ -130,6 +130,31 @@ type InstallSnapshotResponse struct {
 	Success bool `json:"success"` // true only if the snapshot is installed and durable
 }
 
+// ReadIndexRequest asks the leader for a read index: the log position a replica
+// must have applied before it may answer a linearizable read.
+//
+// This is what lets a FOLLOWER serve a linearizable read. The leader supplies
+// only a number — confirmed current by a quorum round — and the follower does the
+// rest: it waits for its own apply to reach that index, then answers from its own
+// state machine. The payload never touches the leader, so read throughput scales
+// with the cluster instead of being pinned to one node.
+//
+// The soundness argument is short. A replica only applies committed entries, and
+// commitment requires a quorum, so nothing a replica has applied can be phantom.
+// The read index just pins how far it must have caught up for the answer to
+// reflect everything committed as of the moment the read was admitted.
+type ReadIndexRequest struct {
+	FromNodeID int `json:"from_node_id"` // for logging only
+}
+
+// ReadIndexResponse carries the confirmed index, or reports that this node could
+// not supply one. Term lets the asker learn it is talking to the wrong node.
+type ReadIndexResponse struct {
+	Term      int  `json:"term"`
+	ReadIndex int  `json:"read_index"`
+	Success   bool `json:"success"` // false if we are not the leader or lost quorum
+}
+
 // PersistentState is the Raft state that MUST survive node restarts.
 // Losing this data can cause a node to vote twice in the same term,
 // which breaks Raft's fundamental safety guarantee.

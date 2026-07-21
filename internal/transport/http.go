@@ -34,7 +34,7 @@ const leaderHintHeader = "X-Raft-Leader"
 type Server struct {
 	node         leaderChecker
 	proposals    chan<- engine.Proposal
-	reads        chan<- engine.Read
+	reader       reader
 	stateMachine store.StateMachine
 	rpc          rpcHandler
 
@@ -53,6 +53,14 @@ type leaderChecker interface {
 	CurrentLeader() int
 }
 
+// reader establishes when a local read is safe. The engine implements it, and
+// handles the leader/follower split internally — a follower fetches a read index
+// from the leader and then serves the read itself, so this layer does not need
+// to know which role it is running on.
+type reader interface {
+	LinearizableRead(timeout time.Duration) error
+}
+
 // rpcHandler owns the full AppendEntries and RequestVote receiver logic (term
 // checks, consistency check, commit advancement, vote decision). The transport
 // layer stays thin: it decodes the request, calls this, and encodes the
@@ -60,6 +68,7 @@ type leaderChecker interface {
 type rpcHandler interface {
 	HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse
 	HandlePreVote(req raft.PreVoteRequest) raft.PreVoteResponse
+	HandleReadIndex(req raft.ReadIndexRequest) raft.ReadIndexResponse
 	HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse
 	HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse
 }
@@ -68,7 +77,7 @@ type rpcHandler interface {
 func NewServer(
 	node leaderChecker,
 	proposals chan<- engine.Proposal,
-	reads chan<- engine.Read,
+	rd reader,
 	sm store.StateMachine,
 	rpc rpcHandler,
 	peers map[int]string,
@@ -76,7 +85,7 @@ func NewServer(
 	return &Server{
 		node:         node,
 		proposals:    proposals,
-		reads:        reads,
+		reader:       rd,
 		stateMachine: sm,
 		rpc:          rpc,
 		peers:        peers,
@@ -90,6 +99,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/delete", s.handleDelete)
 	mux.HandleFunc("/internal/append", s.handleInternalAppend)
 	mux.HandleFunc("/internal/prevote", s.handleInternalPreVote)
+	mux.HandleFunc("/internal/readindex", s.handleInternalReadIndex)
 	mux.HandleFunc("/internal/vote", s.handleInternalVote)
 	mux.HandleFunc("/internal/snapshot", s.handleInternalSnapshot)
 }
@@ -155,9 +165,11 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.submitAndRespond(w, raft.Command{Op: raft.OpDelete, Key: req.Key})
 }
 
-// handleGet serves a read. It is LINEARIZABLE by default (§8): the request is
-// admitted by the leader, held until a majority has confirmed that leadership is
-// still current, and only then answered from the local state machine.
+// handleGet serves a read. It is LINEARIZABLE by default (§8), and ANY node can
+// serve it — a follower fetches a quorum-confirmed read index from the leader,
+// waits for its own state machine to reach that index, and then answers locally.
+// Only the index crosses the network, so read capacity scales with the cluster
+// rather than being pinned to the leader.
 //
 // `?consistency=stale` opts out, reading local state immediately from whichever
 // node is asked. That is the old behavior, and it is genuinely useful — for
@@ -206,40 +218,21 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 // that this node's applied state is current as of the moment the read arrived;
 // what gets read afterwards is not a consensus concern.
 func (s *Server) awaitLinearizableRead(w http.ResponseWriter) bool {
-	if !s.node.IsLeader() {
-		// Only the leader can establish this. Send the client somewhere useful
-		// rather than quietly serving stale local state.
+	err := s.reader.LinearizableRead(readTimeout)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, engine.ErrNotLeader):
+		// Either we do not know who leads, or the leader would not confirm. Send
+		// the client to whoever we last saw rather than quietly serving local
+		// state, which is the stale read this path exists to prevent.
 		s.redirectToLeader(w)
-		return false
+	case errors.Is(err, engine.ErrReadTimeout):
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-
-	resultCh := make(chan error, 1)
-	select {
-	case s.reads <- engine.Read{ResultCh: resultCh}:
-	case <-time.After(readTimeout):
-		http.Error(w, "read queue full", http.StatusServiceUnavailable)
-		return false
-	}
-
-	select {
-	case err := <-resultCh:
-		switch {
-		case err == nil:
-			return true
-		case errors.Is(err, engine.ErrNotLeader):
-			s.redirectToLeader(w)
-		case errors.Is(err, engine.ErrReadTimeout):
-			// We could not prove we are still leader. Refusing is the point.
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		default:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return false
-
-	case <-time.After(readTimeout):
-		http.Error(w, "engine read timeout", http.StatusServiceUnavailable)
-		return false
-	}
+	return false
 }
 
 // ---- Internal cluster handler ----
@@ -281,6 +274,27 @@ func (s *Server) handleInternalPreVote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := s.rpc.HandlePreVote(req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleInternalReadIndex is the ReadIndex endpoint: a follower asking this
+// leader for the log position it must reach before serving a linearizable read.
+// Only an integer travels back — the follower does the reading.
+func (s *Server) handleInternalReadIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req raft.ReadIndexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := s.rpc.HandleReadIndex(req)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)

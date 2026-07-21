@@ -158,18 +158,6 @@ func TestReadsResumeAfterFailover(t *testing.T) {
 	}
 }
 
-// A follower cannot establish that a read is current — only the leader can — so
-// it must refuse rather than answer from its own applied state.
-func TestFollowerRefusesLinearizableRead(t *testing.T) {
-	c := New(t, Options{Size: 3})
-	leader := c.WaitLeader(5 * time.Second)
-
-	follower := c.Nodes[c.Others(leader.ID)[0]]
-	if _, _, err := c.Read(follower, "anything", 2*time.Second); !errors.Is(err, engine.ErrNotLeader) {
-		t.Fatalf("follower read returned %v, want ErrNotLeader", err)
-	}
-}
-
 // Reads must keep working through packet loss — refusing on the first lost
 // heartbeat would make the mechanism useless in practice.
 func TestLinearizableReadsUnderPacketLoss(t *testing.T) {
@@ -187,5 +175,111 @@ func TestLinearizableReadsUnderPacketLoss(t *testing.T) {
 	}
 	if !ok || got != "v" {
 		t.Fatalf("read %q (found=%v), want v", got, ok)
+	}
+}
+
+// ---- F21: followers serve linearizable reads ----
+
+// The point of the exercise. A follower answers a linearizable read from its own
+// state machine after fetching a confirmed read index from the leader — only the
+// index crosses the network, so read capacity scales with the cluster instead of
+// being pinned to the leader.
+func TestFollowersServeLinearizableReads(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "v1", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	for _, id := range c.Others(leader.ID) {
+		got, ok, err := c.Read(c.Nodes[id], "k", 3*time.Second)
+		if err != nil {
+			t.Fatalf("follower %d refused a linearizable read: %v", id, err)
+		}
+		if !ok || got != "v1" {
+			t.Fatalf("follower %d returned %q (found=%v), want v1", id, got, ok)
+		}
+	}
+}
+
+// A follower read must observe a write that has already been acknowledged, even
+// though the follower may not have applied it yet when the read arrives. This is
+// what the read index buys: the follower waits for its own apply to reach the
+// leader's committed frontier before answering.
+func TestFollowerReadObservesAcknowledgedWrite(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+	follower := c.Nodes[c.Others(leader.ID)[0]]
+
+	// Slow the network so replication to the follower genuinely lags the write
+	// acknowledgement — without this the follower is usually already caught up
+	// and the read index never has to do any work.
+	c.SetDelay(15 * time.Millisecond)
+
+	for i, v := range []string{"a", "b", "c", "d", "e"} {
+		if err := c.SetVia(leader, "k", v, 3*time.Second); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		got, ok, err := c.Read(follower, "k", 3*time.Second)
+		if err != nil {
+			t.Fatalf("follower read %d: %v", i, err)
+		}
+		if !ok || got != v {
+			t.Fatalf("follower read %d returned %q (found=%v), want %q — a "+
+				"linearizable read missed an acknowledged write", i, got, ok, v)
+		}
+	}
+}
+
+// A partitioned FOLLOWER must refuse. It cannot reach the leader for a read
+// index, and its own state may be arbitrarily old — this is exactly the case
+// where serving locally would be a stale read.
+func TestPartitionedFollowerRefusesLinearizableRead(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	if err := c.SetVia(leader, "k", "before", 3*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	c.WaitApplied(c.ids(), "k", "before", 5*time.Second)
+
+	follower := c.Nodes[c.Others(leader.ID)[0]]
+	c.Isolate(follower.ID)
+
+	// The cluster moves on without it.
+	if err := c.SetVia(leader, "k", "after", 3*time.Second); err != nil {
+		t.Fatalf("Set after partition: %v", err)
+	}
+
+	// It still holds the old value locally...
+	if v, _ := follower.Store.Get("k"); v != "before" {
+		t.Fatalf("precondition: isolated follower holds %q", v)
+	}
+
+	// ...and must refuse to serve it as linearizable.
+	got, _, err := c.Read(follower, "k", 2*time.Second)
+	if err == nil {
+		t.Fatalf("isolated follower served %q as a linearizable read", got)
+	}
+	if !errors.Is(err, engine.ErrNotLeader) && !errors.Is(err, engine.ErrReadTimeout) {
+		t.Fatalf("refused with %v, want ErrNotLeader or ErrReadTimeout", err)
+	}
+	t.Logf("isolated follower correctly refused: %v", err)
+}
+
+// A follower that has not yet learned who the leader is cannot fetch a read
+// index, and must say so rather than answer from whatever it happens to hold.
+func TestFollowerWithoutKnownLeaderRefuses(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	follower := c.Nodes[c.Others(leader.ID)[0]]
+	// Cut only the follower's path TO the leader; it keeps receiving heartbeats,
+	// so it still believes a leader exists, but cannot ask for a read index.
+	c.Cut(follower.ID, leader.ID)
+
+	if _, _, err := c.Read(follower, "k", 2*time.Second); err == nil {
+		t.Fatal("follower answered a linearizable read without reaching the leader")
 	}
 }

@@ -105,6 +105,17 @@ func (r *Replicator) RequestVoteFrom(peerID int, addr string, req RequestVoteReq
 	return resp, true
 }
 
+// ReadIndexFrom asks the leader at addr for a confirmed read index. ok is false
+// if the leader could not be reached or declined to supply one.
+func (r *Replicator) ReadIndexFrom(addr string, req ReadIndexRequest) (ReadIndexResponse, bool) {
+	resp, err := r.transport.ReadIndex(addr, req)
+	if err != nil {
+		stdlog.Printf("[REPLICATOR] read index from %s failed: %v", addr, err)
+		return ReadIndexResponse{}, false
+	}
+	return resp, true
+}
+
 // InstallSnapshotTo ships a full snapshot to a follower that has fallen behind
 // the leader's compacted log. On success it advances the peer's match/nextIndex
 // to the snapshot boundary (the peer's log now matches through

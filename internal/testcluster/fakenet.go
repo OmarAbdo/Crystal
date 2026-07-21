@@ -32,6 +32,7 @@ import (
 type rpcHandler interface {
 	HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse
 	HandlePreVote(req raft.PreVoteRequest) raft.PreVoteResponse
+	HandleReadIndex(req raft.ReadIndexRequest) raft.ReadIndexResponse
 	HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse
 	HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse
 }
@@ -223,6 +224,12 @@ func (t *nodeTransport) PreVote(addr string, req raft.PreVoteRequest) (raft.PreV
 func (t *nodeTransport) RequestVote(addr string, req raft.RequestVoteRequest) (raft.RequestVoteResponse, error) {
 	return deliver(t, addr, req, func(h rpcHandler, r raft.RequestVoteRequest) raft.RequestVoteResponse {
 		return h.HandleRequestVote(r)
+	})
+}
+
+func (t *nodeTransport) ReadIndex(addr string, req raft.ReadIndexRequest) (raft.ReadIndexResponse, error) {
+	return deliver(t, addr, req, func(h rpcHandler, r raft.ReadIndexRequest) raft.ReadIndexResponse {
+		return h.HandleReadIndex(r)
 	})
 }
 

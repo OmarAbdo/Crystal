@@ -60,6 +60,9 @@ func (stubTransport) AppendEntries(string, raft.AppendEntriesRequest) (raft.Appe
 func (stubTransport) PreVote(string, raft.PreVoteRequest) (raft.PreVoteResponse, error) {
 	return raft.PreVoteResponse{}, errUnreachable
 }
+func (stubTransport) ReadIndex(string, raft.ReadIndexRequest) (raft.ReadIndexResponse, error) {
+	return raft.ReadIndexResponse{}, errUnreachable
+}
 func (stubTransport) RequestVote(string, raft.RequestVoteRequest) (raft.RequestVoteResponse, error) {
 	return raft.RequestVoteResponse{}, errUnreachable
 }
