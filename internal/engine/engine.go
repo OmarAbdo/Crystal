@@ -79,7 +79,6 @@ type Engine struct {
 	stateMachine store.StateMachine
 	snapshots    *store.SnapshotManager
 	replicator   *raft.Replicator
-	peers        map[int]string
 	proposals    chan Proposal
 
 	// Control-loop-only state (accessed solely from the Run goroutine).
@@ -108,7 +107,7 @@ type Engine struct {
 	// straw poll is about (0 when no poll is outstanding); preVotes counts grants.
 	preVoteCh   chan preVoteResult
 	preVoteTerm int
-	preVotes    int
+	preVotes    map[int]bool
 
 	// ---- Leadership evidence (shared by CheckQuorum and ReadIndex) ----
 
@@ -192,7 +191,6 @@ func NewWithTransport(
 		stateMachine: sm,
 		snapshots:    snapshots,
 		replicator:   raft.NewReplicator(transport),
-		peers:        cfg.Peers,
 		proposals:    make(chan Proposal, 100),
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano() + int64(node.NodeID()))),
 		replicators:  make(map[int]*peerReplicator),
@@ -214,6 +212,17 @@ func NewWithTransport(
 
 	e.resetElectionTimeout()
 	return e
+}
+
+// currentPeers is every member this node replicates to and hears from, taken
+// from the node's CONFIGURATION rather than from static startup config.
+//
+// It has to be dynamic: once membership changes flow through the log (§6), the
+// set of servers a leader replicates to, counts votes from, and measures quorum
+// against all change together, and a snapshot of the peers taken at boot would
+// silently describe the wrong cluster.
+func (e *Engine) currentPeers() map[int]string {
+	return e.node.Peers()
 }
 
 // resetElectionTimeout picks a fresh randomized election deadline from the
@@ -605,13 +614,13 @@ func (e *Engine) startPreVote() {
 	lastLogIndex, lastLogTerm := e.raftLog.LastLogState()
 
 	// Alone in the cluster there is nobody to poll and nothing to disrupt.
-	if len(e.peers) == 0 {
+	if len(e.currentPeers()) == 0 {
 		e.runElection()
 		return
 	}
 
 	e.preVoteTerm = term + 1
-	e.preVotes = 1 // we would vote for ourselves
+	e.preVotes = map[int]bool{e.node.NodeID(): true} // we would vote for ourselves
 
 	req := raft.PreVoteRequest{
 		Term:         e.preVoteTerm, // hypothetical; no receiver adopts it
@@ -620,14 +629,14 @@ func (e *Engine) startPreVote() {
 		LastLogTerm:  lastLogTerm,
 	}
 
-	for peerID, addr := range e.peers {
+	for peerID, addr := range e.currentPeers() {
 		go func(pid int, a string) {
 			resp, ok := e.replicator.PreVoteFrom(pid, a, req)
 			if !ok {
 				return
 			}
 			select {
-			case e.preVoteCh <- preVoteResult{pollTerm: req.Term, resp: resp}:
+			case e.preVoteCh <- preVoteResult{pollTerm: req.Term, voterID: pid, resp: resp}:
 			case <-e.done:
 			}
 		}(peerID, addr)
@@ -638,6 +647,7 @@ func (e *Engine) startPreVote() {
 // identifies the poll, so a reply to an abandoned one is discarded.
 type preVoteResult struct {
 	pollTerm int
+	voterID  int
 	resp     raft.PreVoteResponse
 }
 
@@ -670,11 +680,11 @@ func (e *Engine) handlePreVoteResult(v preVoteResult) {
 		return
 	}
 
-	e.preVotes++
-	if e.preVotes > e.node.ClusterSize()/2 {
+	e.preVotes[v.voterID] = true
+	if e.node.HasQuorum(e.preVotes) {
 		// A majority says we could win. NOW it is safe to spend a term.
 		log.Printf("[ENGINE] Pre-vote carried (%d votes) — campaigning for term %d",
-			e.preVotes, v.pollTerm)
+			len(e.preVotes), v.pollTerm)
 		e.preVoteTerm = 0
 		e.runElection()
 	}
@@ -717,19 +727,19 @@ func (e *Engine) runElection() {
 	// A single-node cluster has already reached a majority with its own vote and
 	// has nobody to ask, so it must win here rather than waiting for a reply that
 	// will never come.
-	if len(e.peers) == 0 {
+	if len(e.currentPeers()) == 0 {
 		e.becomeLeader(term, lastLogIndex)
 		return
 	}
 
-	for peerID, addr := range e.peers {
+	for peerID, addr := range e.currentPeers() {
 		go func(pid int, a string) {
 			resp, ok := e.replicator.RequestVoteFrom(pid, a, req)
 			if !ok {
 				return
 			}
 			select {
-			case e.voteCh <- voteResult{electionTerm: term, resp: resp}:
+			case e.voteCh <- voteResult{electionTerm: term, voterID: pid, resp: resp}:
 			case <-e.done:
 			}
 		}(peerID, addr)
@@ -749,6 +759,7 @@ type encodedSnapshot struct {
 // late reply from an abandoned election identifiable and discardable.
 type voteResult struct {
 	electionTerm int
+	voterID      int // WHICH server voted: under a joint configuration, who matters
 	resp         raft.RequestVoteResponse
 }
 
@@ -775,7 +786,7 @@ func (e *Engine) handleVoteResult(v voteResult) {
 
 	// Promote on the vote that reaches the majority — not on the last vote to
 	// arrive (§5.2).
-	if e.node.RecordVoteAndCheckMajority(v.electionTerm) {
+	if e.node.RecordVoteAndCheckMajority(v.voterID, v.electionTerm) {
 		e.becomeLeader(v.electionTerm, e.raftLog.LatestIndex())
 	}
 }
@@ -833,7 +844,7 @@ func (e *Engine) startReplicators() {
 			e.replicatorsTerm, term)
 		e.stopReplicators()
 	}
-	for peerID, addr := range e.peers {
+	for peerID, addr := range e.currentPeers() {
 		pr := &peerReplicator{
 			engine: e,
 			peerID: peerID,

@@ -7,10 +7,17 @@ import (
 	"time"
 )
 
-func newTestNode(t *testing.T, nodeID int, peerIDs []int, clusterSize int) *RaftNode {
+// newTestNode builds a node whose configuration is nodeID plus peerIDs. The
+// clusterSize argument is gone: membership is now the configuration, and its
+// size follows from it.
+func newTestNode(t *testing.T, nodeID int, peerIDs []int, _ int) *RaftNode {
 	t.Helper()
 	meta := filepath.Join(t.TempDir(), "raft.meta")
-	rn, err := NewRaftNode(nodeID, peerIDs, clusterSize, meta, Follower)
+	voters := map[int]string{nodeID: "self"}
+	for _, pid := range peerIDs {
+		voters[pid] = "peer"
+	}
+	rn, err := NewRaftNode(nodeID, NewConfiguration(voters), meta, Follower)
 	if err != nil {
 		t.Fatalf("NewRaftNode: %v", err)
 	}
@@ -246,7 +253,7 @@ func TestRecordVoteAndCheckMajority(t *testing.T) {
 	}
 
 	// One more vote → 2 of 3 = majority.
-	if won := rn.RecordVoteAndCheckMajority(1); !won {
+	if won := rn.RecordVoteAndCheckMajority(2, 1); !won {
 		t.Fatalf("expected majority after 2nd vote in a 3-node cluster")
 	}
 }
@@ -257,7 +264,7 @@ func TestRecordVoteAndCheckMajority_IgnoresStaleTerm(t *testing.T) {
 		t.Fatalf("BecomeCandidate: %v", err)
 	}
 	// A vote tagged with a different term must not count.
-	if won := rn.RecordVoteAndCheckMajority(99); won {
+	if won := rn.RecordVoteAndCheckMajority(2, 99); won {
 		t.Fatalf("stale-term vote should not count toward majority")
 	}
 }
@@ -346,7 +353,8 @@ func TestBecomeFollower_HigherTermClearsVote(t *testing.T) {
 
 func TestPersistentStateSurvivesReload(t *testing.T) {
 	meta := filepath.Join(t.TempDir(), "raft.meta")
-	rn, err := NewRaftNode(1, []int{2, 3}, 3, meta, Follower)
+	cfg := NewConfiguration(map[int]string{1: "self", 2: "peer", 3: "peer"})
+	rn, err := NewRaftNode(1, cfg, meta, Follower)
 	if err != nil {
 		t.Fatalf("NewRaftNode: %v", err)
 	}
@@ -357,7 +365,7 @@ func TestPersistentStateSurvivesReload(t *testing.T) {
 	rn.HandleRequestVote(RequestVoteRequest{Term: 7, CandidateID: 3}, staticLogState(0, 0))
 
 	// Reload from the same metadata file — term and vote must persist.
-	rn2, err := NewRaftNode(1, []int{2, 3}, 3, meta, Follower)
+	rn2, err := NewRaftNode(1, cfg, meta, Follower)
 	if err != nil {
 		t.Fatalf("reload NewRaftNode: %v", err)
 	}

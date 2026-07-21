@@ -17,6 +17,15 @@ import (
 // evidence is a majority saying so, and the evidence has to be NEWER than the
 // question. These tests pin exactly that.
 
+// testConfig builds a simple voter configuration from a list of node IDs.
+func testConfig(ids ...int) raft.Configuration {
+	voters := make(map[int]string, len(ids))
+	for _, id := range ids {
+		voters[id] = fmt.Sprintf("peer-%d", id)
+	}
+	return raft.NewConfiguration(voters)
+}
+
 // newLeaderEngineSized builds an engine whose node is Leader at term, in a
 // cluster of the given size. Peers are numbered 2..size.
 func newLeaderEngineSized(t *testing.T, term, size int) (*Engine, *raft.RaftNode) {
@@ -36,7 +45,12 @@ func newLeaderEngineSized(t *testing.T, term, size int) (*Engine, *raft.RaftNode
 	}
 	t.Cleanup(func() { rl.Close() })
 
-	node, err := raft.NewRaftNode(1, peerIDs, size, filepath.Join(dir, "raft.meta"), raft.Follower)
+	voters := map[int]string{1: "self"}
+	for _, pid := range peerIDs {
+		voters[pid] = peers[pid]
+	}
+	node, err := raft.NewRaftNode(1, raft.NewConfiguration(voters),
+		filepath.Join(dir, "raft.meta"), raft.Follower)
 	if err != nil {
 		t.Fatalf("NewRaftNode: %v", err)
 	}

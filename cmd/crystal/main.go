@@ -40,15 +40,19 @@ func main() {
 	snapshots := store.NewSnapshotManager(cfg.SnapshotPath())
 
 	// ---- Build the Raft node ----
-	var peerIDs []int
-	for pid := range cfg.Peers {
-		peerIDs = append(peerIDs, pid)
+	// The bootstrap configuration is this node plus its configured peers. Once
+	// membership changes are driven through the log (§6) this is only the
+	// STARTING membership; the configuration in the log takes over from there.
+	voters := make(map[int]string, len(cfg.Peers)+1)
+	for pid, addr := range cfg.Peers {
+		voters[pid] = addr
 	}
+	voters[cfg.NodeID] = cfg.SelfAddr()
 
 	// All nodes start as followers. A randomized election timeout will elect a
 	// leader (§5.2) — there is no hardcoded bootstrap leader anymore.
-	clusterSize := len(cfg.Peers) + 1
-	node, err := raft.NewRaftNode(cfg.NodeID, peerIDs, clusterSize, cfg.MetadataPath(), raft.Follower)
+	node, err := raft.NewRaftNode(cfg.NodeID, raft.NewConfiguration(voters),
+		cfg.MetadataPath(), raft.Follower)
 	if err != nil {
 		log.Fatalf("Cannot initialize Raft node: %v", err)
 	}

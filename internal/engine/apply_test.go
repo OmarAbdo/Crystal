@@ -52,7 +52,7 @@ func newApplyEngine(t *testing.T, sm store.StateMachine) (*haltingEngine, *raft.
 	}
 	t.Cleanup(func() { rl.Close() })
 
-	node, err := raft.NewRaftNode(1, []int{2, 3}, 3, filepath.Join(dir, "raft.meta"), raft.Follower)
+	node, err := raft.NewRaftNode(1, testConfig(1, 2, 3), filepath.Join(dir, "raft.meta"), raft.Follower)
 	if err != nil {
 		t.Fatalf("NewRaftNode: %v", err)
 	}

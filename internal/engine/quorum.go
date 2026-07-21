@@ -164,7 +164,7 @@ func (e *Engine) followerRead(timeout time.Duration) error {
 	if leaderID == 0 {
 		return ErrNotLeader // no leader known; the client should retry
 	}
-	addr, ok := e.peers[leaderID]
+	addr, ok := e.currentPeers()[leaderID]
 	if !ok {
 		return ErrNotLeader // leader outside our peer map; nothing we can do
 	}
@@ -277,8 +277,8 @@ func (e *Engine) handleAck(a ackReport) {
 // not had time to break.
 func (e *Engine) resetLeadershipEvidence() {
 	now := time.Now()
-	e.lastAck = make(map[int]peerAck, len(e.peers))
-	for peerID := range e.peers {
+	e.lastAck = make(map[int]peerAck, len(e.currentPeers()))
+	for peerID := range e.currentPeers() {
 		e.lastAck[peerID] = peerAck{at: now}
 	}
 }
@@ -297,7 +297,7 @@ func (e *Engine) resetLeadershipEvidence() {
 // Single-node clusters are exempt: there is no majority to hear from beyond
 // themselves, and they are never wrong about it.
 func (e *Engine) checkQuorum() {
-	if len(e.peers) == 0 {
+	if len(e.currentPeers()) == 0 {
 		return
 	}
 
@@ -610,7 +610,7 @@ func (e *Engine) boundedRead(maxStaleness, timeout time.Duration) error {
 //     leader" must not be a way around the staleness rules.
 //   - Single-node cluster: always current; there is nobody it could be behind.
 func (e *Engine) staleness() time.Duration {
-	if len(e.peers) == 0 {
+	if len(e.currentPeers()) == 0 {
 		return 0
 	}
 	if !e.node.IsLeader() {

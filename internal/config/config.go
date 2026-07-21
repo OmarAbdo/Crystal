@@ -30,6 +30,13 @@ type Config struct {
 	SessionTTL time.Duration
 }
 
+// SelfAddr returns this node's own address as peers would reach it. The port is
+// authoritative; the host is a placeholder for the bootstrap configuration,
+// which only needs self to be present as a voter — nobody dials themselves.
+func (c *Config) SelfAddr() string {
+	return "localhost" + c.Port
+}
+
 // WALPath returns the full path to this node's WAL file.
 func (c *Config) WALPath() string {
 	return filepath.Join(c.DataDir, "raft.wal")

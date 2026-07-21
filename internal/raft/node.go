@@ -31,7 +31,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"sync"
 	"time"
 
@@ -48,9 +47,14 @@ type RaftNode struct {
 	mu sync.RWMutex
 
 	// Identity
-	nodeID      int
-	peerIDs     []int
-	clusterSize int // total voting members (peers + self); fixed at startup
+	nodeID int
+
+	// config is the cluster membership every quorum decision is made against.
+	// It replaces the old fixed clusterSize integer: a majority is not "more than
+	// half of a number" once membership can change, it is whatever the current
+	// configuration says — and during a joint transition it is a majority of two
+	// memberships at once (§6).
+	config Configuration
 
 	// Volatile state (reset on restart — safe per Raft spec)
 	Role        NodeRole
@@ -63,8 +67,13 @@ type RaftNode struct {
 	// a vote; the engine compares it against a randomized election timeout to
 	// decide when to start an election. votesGranted counts votes in the current
 	// election (candidate only).
-	lastContact  time.Time
-	votesGranted int
+	lastContact time.Time
+
+	// votesFrom records WHICH servers granted a vote this election, not merely
+	// how many. Under a joint configuration a count is not enough: the same
+	// number of votes can be a majority of both memberships or of neither,
+	// depending on who they came from.
+	votesFrom map[int]bool
 
 	// minElectionTimeout is the §6 stickiness window: a RequestVote arriving
 	// within this long of hearing from a live leader is ignored outright, term
@@ -89,11 +98,14 @@ type RaftNode struct {
 // NewRaftNode creates a node, loading persistent state from disk if it exists.
 // clusterSize is the total number of voting members (len(peers)+1); it fixes
 // the majority threshold used for elections and commitment.
-func NewRaftNode(nodeID int, peerIDs []int, clusterSize int, metadataPath string, initialRole NodeRole) (*RaftNode, error) {
+func NewRaftNode(nodeID int, config Configuration, metadataPath string, initialRole NodeRole) (*RaftNode, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("initial configuration: %w", err)
+	}
+
 	rn := &RaftNode{
 		nodeID:             nodeID,
-		peerIDs:            peerIDs,
-		clusterSize:        clusterSize,
+		config:             config.Clone(),
 		Role:               initialRole,
 		LeaderID:           0, // unknown until we hear from a leader or win an election
 		CommitIndex:        0,
@@ -109,7 +121,7 @@ func NewRaftNode(nodeID int, peerIDs []int, clusterSize int, metadataPath string
 		},
 	}
 
-	for _, pid := range peerIDs {
+	for pid := range config.Peers(nodeID) {
 		rn.NextIndex[pid] = 1
 		rn.MatchIndex[pid] = 0
 	}
@@ -277,16 +289,15 @@ func (rn *RaftNode) AdvanceCommitIndex(localLatestIndex int, termAt func(index i
 		return rn.CommitIndex, false
 	}
 
-	// Gather all known replicated indices (self + peers).
-	indices := make([]int, 0, len(rn.peerIDs)+1)
-	indices = append(indices, localLatestIndex)
-	for _, idx := range rn.MatchIndex {
-		indices = append(indices, idx)
+	// Ask the configuration where the majority frontier is. During a joint
+	// transition that is the LOWER of the two memberships' frontiers, since an
+	// entry is only committed once both agree.
+	match := make(map[int]int, len(rn.MatchIndex)+1)
+	for id, idx := range rn.MatchIndex {
+		match[id] = idx
 	}
-
-	// Sort descending; the median is the highest index replicated on a majority.
-	sort.Sort(sort.Reverse(sort.IntSlice(indices)))
-	quorumIndex := indices[len(indices)/2]
+	match[rn.nodeID] = localLatestIndex // the leader holds its own entries
+	quorumIndex := rn.config.QuorumIndex(match)
 
 	// Commit only if the QUORUM INDEX ITSELF is a current-term entry (§5.4.2).
 	// Checking the term of quorumIndex — not the leader's last entry — is what
@@ -502,9 +513,36 @@ func (rn *RaftNode) TimeSinceContact() time.Duration {
 	return time.Since(rn.lastContact)
 }
 
-// ClusterSize returns the fixed number of voting members.
+// Config returns a copy of the current cluster configuration.
+func (rn *RaftNode) Config() Configuration {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return rn.config.Clone()
+}
+
+// ClusterSize returns the number of voting members in the current configuration.
+// It is a reporting convenience only — quorum decisions must go through the
+// configuration, which during a joint transition is not a single number.
 func (rn *RaftNode) ClusterSize() int {
-	return rn.clusterSize
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return len(rn.config.Voters)
+}
+
+// HasQuorum reports whether the given set of servers constitutes agreement under
+// the current configuration.
+func (rn *RaftNode) HasQuorum(have map[int]bool) bool {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return rn.config.HasQuorum(have)
+}
+
+// Peers returns the members this node replicates to (everyone but itself,
+// learners included).
+func (rn *RaftNode) Peers() map[int]string {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return rn.config.Peers(rn.nodeID)
 }
 
 // BecomeCandidate starts a new election (Figure 2, Candidates): it increments
@@ -532,7 +570,7 @@ func (rn *RaftNode) BecomeCandidate() (term int, err error) {
 
 	rn.Role = Candidate
 	rn.LeaderID = 0
-	rn.votesGranted = 1 // vote for self
+	rn.votesFrom = map[int]bool{rn.nodeID: true} // vote for self
 	rn.lastContact = time.Now()
 
 	log.Printf("[RAFT] Node %d starting election for term %d", rn.nodeID, rn.persistent.CurrentTerm)
@@ -542,15 +580,18 @@ func (rn *RaftNode) BecomeCandidate() (term int, err error) {
 // RecordVoteAndCheckMajority tallies one granted vote for the current election
 // and reports whether the candidate now holds a majority. It ignores votes if
 // the node is no longer a candidate or the vote came from a stale term.
-func (rn *RaftNode) RecordVoteAndCheckMajority(voteTerm int) (wonMajority bool) {
+func (rn *RaftNode) RecordVoteAndCheckMajority(voterID, voteTerm int) (wonMajority bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
 	if rn.Role != Candidate || voteTerm != rn.persistent.CurrentTerm {
 		return false
 	}
-	rn.votesGranted++
-	return rn.votesGranted > rn.clusterSize/2
+	if rn.votesFrom == nil {
+		rn.votesFrom = map[int]bool{rn.nodeID: true}
+	}
+	rn.votesFrom[voterID] = true
+	return rn.config.HasQuorum(rn.votesFrom)
 }
 
 // HandleRequestVote implements the RequestVote receiver (Figure 2). It is the
@@ -782,7 +823,12 @@ func (rn *RaftNode) BecomeLeader(electionTerm, lastLogIndex int) (promoted bool)
 
 	rn.Role = Leader
 	rn.LeaderID = rn.nodeID
-	for pid := range rn.MatchIndex {
+	// Reinitialize progress for exactly the current membership (Figure 2). Built
+	// fresh rather than updated in place, so a server that has left the
+	// configuration does not linger in the maps and skew the quorum frontier.
+	rn.NextIndex = make(map[int]int)
+	rn.MatchIndex = make(map[int]int)
+	for pid := range rn.config.Peers(rn.nodeID) {
 		rn.NextIndex[pid] = lastLogIndex + 1
 		rn.MatchIndex[pid] = 0
 	}

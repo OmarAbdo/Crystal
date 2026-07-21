@@ -81,13 +81,12 @@ func New(t *testing.T, opts Options) *Cluster {
 
 	for id := 1; id <= opts.Size; id++ {
 		peers := make(map[int]string, opts.Size-1)
-		peerIDs := make([]int, 0, opts.Size-1)
+		voters := make(map[int]string, opts.Size)
 		for other := 1; other <= opts.Size; other++ {
-			if other == id {
-				continue
+			voters[other] = addr(other)
+			if other != id {
+				peers[other] = addr(other)
 			}
-			peers[other] = addr(other)
-			peerIDs = append(peerIDs, other)
 		}
 
 		dir := t.TempDir()
@@ -104,7 +103,7 @@ func New(t *testing.T, opts Options) *Cluster {
 		}
 		rl.SetCompactionThreshold(opts.CompactionThreshold)
 
-		rn, err := raft.NewRaftNode(id, peerIDs, opts.Size, cfg.MetadataPath(), raft.Follower)
+		rn, err := raft.NewRaftNode(id, raft.NewConfiguration(voters), cfg.MetadataPath(), raft.Follower)
 		if err != nil {
 			t.Fatalf("node %d: NewRaftNode: %v", id, err)
 		}
