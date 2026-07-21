@@ -871,3 +871,37 @@ func (rn *RaftNode) commitPersistentLocked(next PersistentState) error {
 	rn.persistent = next
 	return nil
 }
+
+// HandlePreVote answers a pre-vote straw poll (dissertation §9.6).
+//
+// The defining property is that it changes NOTHING. No term is adopted, no vote
+// is recorded, no timer is reset. A pre-vote is a question — "would you vote for
+// me if I asked?" — and answering a question must not commit the answerer to
+// anything, or the poll would itself become the disruption it prevents.
+//
+// A grant requires all three of:
+//
+//   - no live leader within the stickiness window (§6), because a node happy
+//     with its current leader should not encourage a challenger;
+//   - the candidate's hypothetical term actually exceeds ours, since a candidate
+//     that is behind cannot win;
+//   - the candidate's log is at least as up-to-date as ours (§5.4.1), the same
+//     restriction a real vote applies — otherwise the poll would green-light a
+//     campaign the real election must reject.
+func (rn *RaftNode) HandlePreVote(req PreVoteRequest, lastLogState func() (index, term int)) PreVoteResponse {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+
+	resp := PreVoteResponse{Term: rn.persistent.CurrentTerm}
+
+	if rn.LeaderID != 0 && time.Since(rn.lastContact) < rn.minElectionTimeout {
+		return resp
+	}
+	if req.Term <= rn.persistent.CurrentTerm {
+		return resp
+	}
+
+	myLastIndex, myLastTerm := lastLogState()
+	resp.VoteGranted = candidateUpToDate(req.LastLogTerm, req.LastLogIndex, myLastTerm, myLastIndex)
+	return resp
+}

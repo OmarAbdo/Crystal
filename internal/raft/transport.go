@@ -29,6 +29,7 @@ import (
 // rejected AppendEntries is a successful RPC carrying Success: false.
 type Transport interface {
 	AppendEntries(addr string, req AppendEntriesRequest) (AppendEntriesResponse, error)
+	PreVote(addr string, req PreVoteRequest) (PreVoteResponse, error)
 	RequestVote(addr string, req RequestVoteRequest) (RequestVoteResponse, error)
 	InstallSnapshot(addr string, req InstallSnapshotRequest) (InstallSnapshotResponse, error)
 }
@@ -47,6 +48,10 @@ func NewHTTPTransport(timeout time.Duration) *HTTPTransport {
 
 func (t *HTTPTransport) AppendEntries(addr string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
 	return postJSON[AppendEntriesRequest, AppendEntriesResponse](t.client, addr, "internal/append", req)
+}
+
+func (t *HTTPTransport) PreVote(addr string, req PreVoteRequest) (PreVoteResponse, error) {
+	return postJSON[PreVoteRequest, PreVoteResponse](t.client, addr, "internal/prevote", req)
 }
 
 func (t *HTTPTransport) RequestVote(addr string, req RequestVoteRequest) (RequestVoteResponse, error) {

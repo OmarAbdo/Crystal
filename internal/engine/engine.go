@@ -104,6 +104,12 @@ type Engine struct {
 	// election goroutine never blocks on a control loop busy elsewhere.
 	voteCh chan voteResult
 
+	// Pre-vote state, control-loop only. preVoteTerm is the term the current
+	// straw poll is about (0 when no poll is outstanding); preVotes counts grants.
+	preVoteCh   chan preVoteResult
+	preVoteTerm int
+	preVotes    int
+
 	// ---- Leadership evidence (shared by CheckQuorum and ReadIndex) ----
 
 	// roundSeq numbers replication rounds. A replicator claims one BEFORE it
@@ -173,6 +179,7 @@ func NewWithTransport(
 		replicators:  make(map[int]*peerReplicator),
 		stepDownCh:   make(chan int, len(cfg.Peers)+1),
 		voteCh:       make(chan voteResult, len(cfg.Peers)+1),
+		preVoteCh:    make(chan preVoteResult, len(cfg.Peers)+1),
 		ackCh:        make(chan ackReport, 4*(len(cfg.Peers)+1)),
 		lastAck:      make(map[int]peerAck, len(cfg.Peers)),
 		readCh:       make(chan Read, 100),
@@ -224,6 +231,9 @@ func (e *Engine) Run(done <-chan struct{}) {
 
 		case higherTerm := <-e.stepDownCh:
 			e.handleStepDown(higherTerm)
+
+		case v := <-e.preVoteCh:
+			e.handlePreVoteResult(v)
 
 		case v := <-e.voteCh:
 			e.handleVoteResult(v)
@@ -355,7 +365,7 @@ func (e *Engine) onTick() {
 		commitIndex, _ := e.node.CommitAndApplyBoundary()
 		e.fireCommittedWaiters(commitIndex, term)
 	} else if e.node.TimeSinceContact() >= e.electionTimeout {
-		e.runElection()
+		e.startPreVote()
 	}
 
 	e.applyCommitted()
@@ -543,6 +553,100 @@ func (e *Engine) compact(snapshotIndex int) {
 }
 
 // ---- Elections ----
+
+// startPreVote runs the straw poll that precedes a real election (dissertation
+// §9.6). Like runElection it returns immediately; replies arrive on preVoteCh.
+//
+// Nothing is incremented and nothing is persisted here. That is the entire
+// point: a node cut off from the cluster times out over and over, and if each
+// timeout bumped its term it would return with a term far ahead of everyone
+// else. That term propagates through the AppendEntries response it sends the
+// leader, and Figure 2 obliges the leader to step down — so a node that was
+// never a viable candidate deposes a working one, repeatedly. Asking first means
+// the term only moves when a majority says a campaign could succeed.
+func (e *Engine) startPreVote() {
+	// Arm the retry now: if the poll stalls, the next attempt is already
+	// scheduled and depends on nothing completing.
+	e.resetElectionTimeout()
+
+	term := e.node.CurrentTerm()
+	lastLogIndex, lastLogTerm := e.raftLog.LastLogState()
+
+	// Alone in the cluster there is nobody to poll and nothing to disrupt.
+	if len(e.peers) == 0 {
+		e.runElection()
+		return
+	}
+
+	e.preVoteTerm = term + 1
+	e.preVotes = 1 // we would vote for ourselves
+
+	req := raft.PreVoteRequest{
+		Term:         e.preVoteTerm, // hypothetical; no receiver adopts it
+		CandidateID:  e.node.NodeID(),
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+
+	for peerID, addr := range e.peers {
+		go func(pid int, a string) {
+			resp, ok := e.replicator.PreVoteFrom(pid, a, req)
+			if !ok {
+				return
+			}
+			select {
+			case e.preVoteCh <- preVoteResult{pollTerm: req.Term, resp: resp}:
+			case <-e.done:
+			}
+		}(peerID, addr)
+	}
+}
+
+// preVoteResult carries one pre-vote reply back to the control loop. pollTerm
+// identifies the poll, so a reply to an abandoned one is discarded.
+type preVoteResult struct {
+	pollTerm int
+	resp     raft.PreVoteResponse
+}
+
+// handlePreVoteResult tallies one pre-vote. Control loop only.
+func (e *Engine) handlePreVoteResult(v preVoteResult) {
+	// A reply to a poll we have moved past, or one we already won, tells us
+	// nothing. preVoteTerm is zeroed on promotion to close the second case.
+	if v.pollTerm != e.preVoteTerm {
+		return
+	}
+
+	role, term := e.node.State()
+	if role == raft.Leader || term >= v.pollTerm {
+		return
+	}
+
+	// A responder ahead of us is real information, unlike the poll itself: we are
+	// behind and should follow, not campaign.
+	if v.resp.Term > term {
+		log.Printf("[ENGINE] Pre-vote: peer reports term %d > %d, standing down",
+			v.resp.Term, term)
+		if err := e.node.BecomeFollower(v.resp.Term, 0); err != nil {
+			log.Printf("[ENGINE] Stepdown persist failed: %v", err)
+		}
+		e.preVoteTerm = 0
+		return
+	}
+
+	if !v.resp.VoteGranted {
+		return
+	}
+
+	e.preVotes++
+	if e.preVotes > e.node.ClusterSize()/2 {
+		// A majority says we could win. NOW it is safe to spend a term.
+		log.Printf("[ENGINE] Pre-vote carried (%d votes) — campaigning for term %d",
+			e.preVotes, v.pollTerm)
+		e.preVoteTerm = 0
+		e.runElection()
+	}
+}
 
 // runElection starts one election attempt (§5.2) and RETURNS IMMEDIATELY.
 //
@@ -778,6 +882,12 @@ func (e *Engine) buildSnapshotRequest() (raft.InstallSnapshotRequest, bool) {
 // HandleAppendEntries binds the AppendEntries receiver to this node's log.
 func (e *Engine) HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse {
 	return e.node.HandleAppendEntries(e.raftLog, req)
+}
+
+// HandlePreVote binds the pre-vote receiver to this node's log. It changes no
+// state on this node at all — see RaftNode.HandlePreVote.
+func (e *Engine) HandlePreVote(req raft.PreVoteRequest) raft.PreVoteResponse {
+	return e.node.HandlePreVote(req, e.raftLog.LastLogState)
 }
 
 // HandleRequestVote binds the RequestVote receiver to this node's log. The log

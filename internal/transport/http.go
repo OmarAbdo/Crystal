@@ -59,6 +59,7 @@ type leaderChecker interface {
 // response. All consensus logic lives behind this seam in the raft package.
 type rpcHandler interface {
 	HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse
+	HandlePreVote(req raft.PreVoteRequest) raft.PreVoteResponse
 	HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse
 	HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse
 }
@@ -88,6 +89,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/get", s.handleGet)
 	mux.HandleFunc("/delete", s.handleDelete)
 	mux.HandleFunc("/internal/append", s.handleInternalAppend)
+	mux.HandleFunc("/internal/prevote", s.handleInternalPreVote)
 	mux.HandleFunc("/internal/vote", s.handleInternalVote)
 	mux.HandleFunc("/internal/snapshot", s.handleInternalSnapshot)
 }
@@ -259,6 +261,26 @@ func (s *Server) handleInternalAppend(w http.ResponseWriter, r *http.Request) {
 	// follower's term and (on rejection) the conflict hints the leader uses
 	// to backtrack nextIndex.
 	resp := s.rpc.HandleAppendEntries(req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleInternalPreVote is the pre-vote endpoint. Answering it commits this node
+// to nothing, which is what makes the straw poll safe to run.
+func (s *Server) handleInternalPreVote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req raft.PreVoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := s.rpc.HandlePreVote(req)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)

@@ -66,6 +66,36 @@ type RequestVoteRequest struct {
 	LastLogTerm  int `json:"last_log_term"`  // term of candidate's last log entry
 }
 
+// PreVoteRequest asks a peer whether it WOULD vote for this candidate, without
+// anyone changing any state (dissertation §9.6).
+//
+// An isolated node that keeps timing out increments its term on every attempt.
+// When it rejoins, that inflated term propagates — not only through RequestVote
+// but through the AppendEntries response it sends the leader, which Figure 2
+// obliges the leader to honour by stepping down. A healthy cluster is disrupted
+// by a node that was never a candidate for anything.
+//
+// Pre-vote closes it at the source: the term is only incremented once a majority
+// has said the candidate could plausibly win. A node alone on the wrong side of a
+// partition never gets that majority, so its term never moves, so it has nothing
+// disruptive to say when it returns.
+//
+// Term here is the term the candidate WOULD campaign in (currentTerm + 1). It is
+// hypothetical; no receiver adopts it.
+type PreVoteRequest struct {
+	Term         int `json:"term"`           // the term the candidate would use
+	CandidateID  int `json:"candidate_id"`
+	LastLogIndex int `json:"last_log_index"`
+	LastLogTerm  int `json:"last_log_term"`
+}
+
+// PreVoteResponse reports whether the peer would grant a real vote. Term is the
+// responder's actual current term, which lets a candidate discover it is behind.
+type PreVoteResponse struct {
+	Term        int  `json:"term"`
+	VoteGranted bool `json:"vote_granted"`
+}
+
 // RequestVoteResponse is returned by the voter.
 type RequestVoteResponse struct {
 	Term        int  `json:"term"`         // currentTerm, for candidate to update itself

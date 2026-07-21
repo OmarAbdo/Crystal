@@ -225,6 +225,76 @@ func TestControlLoopResponsiveDuringElection(t *testing.T) {
 
 // ---- F13/F20: disruption from a rejoining node ----
 
+// ---- F13: a rejoining node must not depose a healthy leader ----
+
+// Dissertation §9.6. A node cut off from the cluster times out over and over.
+// Without pre-vote each timeout increments its term, so it returns with a term
+// far ahead of everyone else — and that term reaches the leader through the
+// AppendEntries RESPONSE, which Figure 2 obliges the leader to honour by
+// stepping down. A node that was never a viable candidate deposes a working
+// leader, and does it again on every rejoin.
+//
+// §6's stickiness check (F13) cannot fix this: it stops the vote being granted,
+// not the term propagating. Pre-vote fixes it at the source — the term only
+// moves once a majority has said a campaign could succeed, and a node alone on
+// the wrong side of a partition never gets that majority.
+//
+// So the assertion is about the isolated node's TERM, not just the leader's
+// survival: if the term never moves, there is nothing disruptive left to say.
+func TestRejoiningNodeDoesNotDisruptLeader(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	victim := c.Nodes[c.Others(leader.ID)[0]]
+	termBefore := victim.Raft.CurrentTerm()
+
+	// Isolate it for several election timeouts. Pre-vote should keep it polling
+	// fruitlessly rather than campaigning.
+	c.Isolate(victim.ID)
+	time.Sleep(2 * time.Second)
+
+	if got := victim.Raft.CurrentTerm(); got != termBefore {
+		t.Fatalf("isolated node's term moved %d → %d while it could not reach a "+
+			"quorum; pre-vote must not let a term be spent on an unwinnable "+
+			"election", termBefore, got)
+	}
+	t.Logf("isolated node held term %d through 2s of failed polls", termBefore)
+
+	leaderTerm := leader.Raft.CurrentTerm()
+
+	// It rejoins.
+	c.Heal(victim.ID)
+	time.Sleep(1500 * time.Millisecond)
+
+	if !leader.Raft.IsLeader() {
+		t.Fatalf("node %d was deposed by a rejoining node", leader.ID)
+	}
+	if got := leader.Raft.CurrentTerm(); got != leaderTerm {
+		t.Fatalf("leader term moved %d → %d on a rejoin; a healthy leader's term "+
+			"must not be dragged up by a node returning from a partition",
+			leaderTerm, got)
+	}
+
+	// And the cluster still works.
+	if err := c.SetVia(leader, "after-rejoin", "ok", 3*time.Second); err != nil {
+		t.Fatalf("write after rejoin: %v", err)
+	}
+}
+
+// Pre-vote must not prevent a legitimate election: when the leader really is
+// gone, the remaining majority grants pre-votes and the campaign proceeds.
+func TestPreVoteAllowsElectionWhenLeaderIsGone(t *testing.T) {
+	c := New(t, Options{Size: 5})
+	leader := c.WaitLeader(5 * time.Second)
+
+	c.Isolate(leader.ID)
+
+	start := time.Now()
+	next := c.WaitLeaderAmong(c.Others(leader.ID), 6*time.Second)
+	t.Logf("pre-vote + election completed in %s (%d → %d)",
+		time.Since(start).Truncate(time.Millisecond), leader.ID, next.ID)
+}
+
 // The check must not prevent legitimate elections: once the leader really is
 // gone, followers stop hearing from it, the stickiness window lapses, and a new
 // leader is elected normally.

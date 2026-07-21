@@ -57,6 +57,9 @@ type stubTransport struct{}
 func (stubTransport) AppendEntries(string, raft.AppendEntriesRequest) (raft.AppendEntriesResponse, error) {
 	return raft.AppendEntriesResponse{}, errUnreachable
 }
+func (stubTransport) PreVote(string, raft.PreVoteRequest) (raft.PreVoteResponse, error) {
+	return raft.PreVoteResponse{}, errUnreachable
+}
 func (stubTransport) RequestVote(string, raft.RequestVoteRequest) (raft.RequestVoteResponse, error) {
 	return raft.RequestVoteResponse{}, errUnreachable
 }

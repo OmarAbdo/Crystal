@@ -31,6 +31,7 @@ import (
 // transport delivers to in production.
 type rpcHandler interface {
 	HandleAppendEntries(req raft.AppendEntriesRequest) raft.AppendEntriesResponse
+	HandlePreVote(req raft.PreVoteRequest) raft.PreVoteResponse
 	HandleRequestVote(req raft.RequestVoteRequest) raft.RequestVoteResponse
 	HandleInstallSnapshot(req raft.InstallSnapshotRequest) raft.InstallSnapshotResponse
 }
@@ -210,6 +211,12 @@ func deliver[Req any, Resp any](
 func (t *nodeTransport) AppendEntries(addr string, req raft.AppendEntriesRequest) (raft.AppendEntriesResponse, error) {
 	return deliver(t, addr, req, func(h rpcHandler, r raft.AppendEntriesRequest) raft.AppendEntriesResponse {
 		return h.HandleAppendEntries(r)
+	})
+}
+
+func (t *nodeTransport) PreVote(addr string, req raft.PreVoteRequest) (raft.PreVoteResponse, error) {
+	return deliver(t, addr, req, func(h rpcHandler, r raft.PreVoteRequest) raft.PreVoteResponse {
+		return h.HandlePreVote(r)
 	})
 }
 

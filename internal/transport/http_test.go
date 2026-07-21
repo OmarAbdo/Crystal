@@ -34,6 +34,9 @@ type nilRPC struct{}
 func (nilRPC) HandleAppendEntries(raft.AppendEntriesRequest) raft.AppendEntriesResponse {
 	return raft.AppendEntriesResponse{}
 }
+func (nilRPC) HandlePreVote(raft.PreVoteRequest) raft.PreVoteResponse {
+	return raft.PreVoteResponse{}
+}
 func (nilRPC) HandleRequestVote(raft.RequestVoteRequest) raft.RequestVoteResponse {
 	return raft.RequestVoteResponse{}
 }

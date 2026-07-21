@@ -82,6 +82,17 @@ func (r *Replicator) ReplicateTo(node *RaftNode, log *RaftLog, peerID int, addr 
 	return result.Term
 }
 
+// PreVoteFrom asks one peer whether it would vote for us. ok is false if the
+// peer could not be reached.
+func (r *Replicator) PreVoteFrom(peerID int, addr string, req PreVoteRequest) (PreVoteResponse, bool) {
+	resp, err := r.transport.PreVote(addr, req)
+	if err != nil {
+		stdlog.Printf("[REPLICATOR] Peer %d (%s) pre-vote failed: %v", peerID, addr, err)
+		return PreVoteResponse{}, false
+	}
+	return resp, true
+}
+
 // RequestVoteFrom sends a single RequestVote RPC to the peer at addr and returns
 // the decoded response. ok is false if the peer was unreachable or replied
 // badly. The engine tallies votes and detects term-stepdown from the responses.
