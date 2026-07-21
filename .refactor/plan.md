@@ -8,6 +8,55 @@ version, May 2014).
 used. Every fix here is re-derived from scratch on clean `3ce740d`. Do not
 `git stash pop`. The stash stays as a reference artifact only.
 
+---
+
+## START HERE — handoff as of 2026-07-21
+
+**Branch `raft-conformance-fixes`, 35 commits ahead of `main`, nothing pushed,
+tree clean.** All suites green: `go build ./...`, `go vet ./...`,
+`go test ./...`, `go test ./internal/testcluster/ -count=3`, and
+`go test -tags integration -count=1 ./internal/integration/` (~60s).
+
+**29 findings closed. One item is in progress: F16, step 1 of 3.**
+Everything else in this document is done. Pick up at *"F16 — remaining work"*
+below, which is written to be startable cold.
+
+### Things learned here that are not obvious from the code
+
+Worth reading before changing anything, because each cost a wrong turn:
+
+1. **A test that passes may be proving nothing.** Three times this session a test
+   passed against the *broken* implementation: the F1 TOCTOU (needed a rendezvous
+   hook, not a stress loop), the F9 election test (the fake network failed cut
+   links *instantly*, which models a refused connection, not a black hole —
+   `SetBlackholeDelay` fixed it), and `TestFollowerRefusesLinearizableRead` (which
+   was passing for a timing reason unrelated to its claim). **Always run a new
+   test against the unfixed code**, or reconstruct the bug and A/B it.
+2. **Sometimes the test is wrong, not the code.** The F1 InstallSnapshot test and
+   the F18 minority-partition test both asserted things that were not invariants.
+   Check which one is wrong before "fixing" anything.
+3. **Two findings came out of writing tests, not from the review:** F19
+   (CheckQuorum) and F20 (pre-vote). Expect more of this in F16.
+4. **§6's stickiness check (F13) alone does not stop a rejoining node disrupting
+   the cluster** — the inflated term arrives via the *AppendEntries response*,
+   which Figure 2 obliges the leader to honour. Pre-vote (F20) is the actual fix.
+   Both are already in.
+5. **The state machine must be deterministic.** No `time.Now()`, no randomness.
+   Session expiry (F23) takes its clock from `Command.Timestamp` in the log for
+   exactly this reason. F16 must respect the same rule.
+6. **Long heredocs to the Bash tool break.** Use the Write tool for large files.
+
+### Where to look
+
+| Concern | File |
+| --- | --- |
+| Membership, quorum math | `internal/raft/configuration.go` |
+| Node state, RPC receivers | `internal/raft/node.go` (lock order `rn.mu → rl.mu`) |
+| WAL, log, compaction | `internal/raft/log.go` |
+| Control loop, elections, replication | `internal/engine/engine.go` |
+| ReadIndex, CheckQuorum, bounded reads | `internal/engine/quorum.go` |
+| Partition-testing harness | `internal/testcluster/` (fake net, directed cuts) |
+
 ## Invariants for this work
 
 - One finding per commit — unless splitting would leave the tree uncompilable or
@@ -267,7 +316,7 @@ outnumber writes heavily. Two findings came out of that discussion:
       this lands; §6's check is the paper's own remedy and comes first.
 
 - [~] **F16 — no membership changes (§6 joint consensus).** *(step 1 of 3 done,
-      `386372b`)*
+      `386372b`)* — see **"F16 — remaining work"** below for steps 2 and 3.
 
       **Done — step 1: membership is a `Configuration`, not an integer.**
       `raft.Configuration{Voters, OldVoters, Learners}` owns every quorum
@@ -277,33 +326,95 @@ outnumber writes heavily. Two findings came out of that discussion:
       under a joint config). `BecomeLeader` rebuilds progress maps for exactly
       the current membership. The engine's peer set derives from the node's
       configuration rather than startup config. No behavior change; 12 new tests
-      for the quorum math.
+      for the quorum math in `internal/raft/configuration_test.go`.
 
-      **Remaining — step 2: configuration entries in the log.** `OpConfig`
-      command; applied **on append, not on commit** (§6: "a server always uses
-      the latest configuration in its log, regardless of whether the entry is
-      committed"), which means the log-append path must notify the node and a
-      truncation must roll the configuration back — so the node needs a
-      configuration *history* keyed by index, not a single value. The
-      configuration must also go into snapshots (§7: "the snapshot also includes
-      the latest configuration in the log as of last included index").
-
-      **Remaining — step 3: the transition itself.** Leader appends `C_old,new`;
-      once it commits, appends `C_new`; once *that* commits, a leader not in
-      `C_new` steps down (§6). Learner catch-up phase before promotion. Admin
-      API to add/remove a server. §6's disruption remedies are already in place
-      (F13 stickiness, F20 pre-vote), which is what makes removed servers safe.
-
-      Original analysis: `clusterSize` is
-      fixed at construction from `-peers`. Largest single item in the plan.
-      *Sub-item to do now regardless:* `parsePeers`
-      ([config.go:69](../internal/config/config.go#L69)) does not reject a peers
-      list containing the node's own ID, which silently inflates the majority
-      threshold on that node alone. Cheap, land it in Phase 7.
-      *Decision:* defer joint consensus until Phases 0–5 are green. Re-scope
-      then.
+      **M1 was the cheap sub-item of this finding and is already done**
+      (`6c811f4`): `parsePeers` rejects a peers list containing the node's own ID.
 
 ---
+
+## F16 — remaining work (steps 2 and 3)
+
+Start here in a fresh session. Step 1 (`386372b`) is done and is the foundation:
+`internal/raft/configuration.go` already has the joint-quorum math, learners, and
+`EnterJoint`/`LeaveJoint`, all unit-tested. Nothing below changes that file much;
+the work is wiring it into the log, the transition, and the API.
+
+### Step 2 — configuration entries in the log
+
+**The one rule that shapes everything:** §6 — *"a server always uses the latest
+configuration in its log, regardless of whether the entry is committed."*
+Configuration takes effect **on append, not on commit**. That is not an
+optimization, it is what makes the joint phase safe: a server must not be voting
+under a configuration it has already superseded in its own log.
+
+Two consequences that make this more invasive than it looks:
+
+1. **The log-append path must notify the node.** `RaftLog.AppendLeader` and
+   `RaftLog.AppendEntriesToLog` both need to surface config entries so
+   `RaftNode` can adopt them. Watch the lock order — it is `rn.mu → rl.mu`, so
+   the log must not call back into the node. Prefer returning the config entries
+   from the log call and letting the *caller* (already holding `rn.mu` in the
+   receivers, per F1) apply them.
+2. **A truncation must roll the configuration BACK.** A follower whose
+   conflicting suffix is overwritten may be discarding a config entry it already
+   adopted. So the node needs a configuration **history** keyed by log index —
+   a small stack of `{index, Configuration}` — not a single current value.
+   Current config = the entry with the highest index ≤ last log index; base of
+   the stack = the snapshot's configuration (or the bootstrap config).
+
+Also required:
+
+- `OpConfig` command carrying a serialized `Configuration`.
+- **Config in snapshots** (§7: *"the snapshot also includes the latest
+  configuration in the log as of last included index"*). Without it a node that
+  restores from a snapshot has no idea who is in the cluster. `SnapshotMeta` is
+  the natural home; note `SnapshotFile.State` is now opaque `json.RawMessage`
+  belonging to the state machine, so the config does **not** go in there.
+- Reject a second config change while one is in flight (§6 allows only one
+  outstanding change at a time; overlapping changes are not safe).
+
+*Tests:* config adopted on append before commit; config rolled back when the
+entry is truncated; config survives snapshot + restore; a node restoring from a
+snapshot knows its membership.
+
+### Step 3 — the transition, learners, and the API
+
+The sequence from §6, driven by the leader:
+
+1. Client asks to add or remove a server.
+2. Leader appends `C_old,new` (joint). It takes effect immediately on append.
+3. When `C_old,new` **commits**, leader appends `C_new`.
+4. When `C_new` **commits**, the transition is over. Servers not in `C_new` can
+   be shut down, and **if the leader itself is not in `C_new` it steps down** —
+   §6 is explicit that this happens once `C_new` is committed, because that is
+   the first moment the new configuration can operate independently.
+
+Learners (§6): *"new servers join the cluster as non-voting members... Once the
+new servers have caught up, the reconfiguration can proceed."* Add the server as
+a learner first, replicate to it, and only start the joint transition once its
+`matchIndex` is close to the leader's. `Configuration.Learners` and
+`QuorumIndex`'s learner exclusion are already implemented and tested.
+
+Also:
+
+- `reconcileLeadership` must restart replicators when the **configuration**
+  changes, not only when the term does. It currently keys on `replicatorsTerm`.
+- Admin endpoint (`/admin/config` or similar) to request add/remove, plus a way
+  to read the current configuration.
+- A removed or demoted leader must stop serving reads — the ReadIndex path keys
+  off `IsLeader`, so check that stepping down on `C_new` commit routes through
+  the same path as any other stepdown.
+
+*Tests (harness):* grow 3→5 and shrink 5→3 with writes flowing throughout; a
+leader removed by the change steps down and the cluster elects from `C_new`;
+`CheckSingleLeaderPerTerm` must hold across every transition — it is sampled in
+every poll loop, so it will catch a split automatically; a partitioned node
+during a transition never forms a second majority.
+
+**Expect the joint-phase quorum to be where a bug would hide.** The harness can
+express it: cut the network so that a majority exists in `C_old` but not in
+`C_new`, and assert nothing commits.
 
 ## Phase 7 — Minors and hygiene
 
@@ -343,10 +454,11 @@ black-holed peers, and no unit test would have shown that. Phase 4 was the one
 structural change, giving leadership a single owner so F7, F8, F15 and F9
 collapsed into one design instead of four patches.
 
-**What remains, and why in this order.** F10 is a one-line correctness fix and
-should land first. F4 is small and closes a Leader Completeness hole. F12 is the
-largest remaining item and should absorb F19, since CheckQuorum and ReadIndex
-need the same per-peer ack machinery — building it twice would be the mistake.
-F13 is cheap once the harness is trusted. F14 changes the wire format and the
-StateMachine interface, so it wants a stable core beneath it. F16 (joint
-consensus) stays last and may be re-scoped.
+**What remains.** Only F16 steps 2 and 3 — the specification is above. Every
+other finding in this document is closed.
+
+The sequencing advice that used to sit here is spent: F10, F4, F12+F19, F13 and
+F14 all landed in that order, and it held up. The two additions that were not in
+the original review — F21/F22 (read scalability, from a design conversation) and
+F19/F20 (found while writing tests) — are the reason the read path and the
+election path ended up stronger than the review asked for.
