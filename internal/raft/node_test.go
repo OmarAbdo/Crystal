@@ -571,3 +571,25 @@ func TestHandleRequestVote_StickinessDoesNotApplyWithoutAKnownLeader(t *testing.
 			"must key on a live leader, not on any recent contact")
 	}
 }
+
+// M3: AdvanceCommitIndex counts one index per MatchIndex entry to find the
+// quorum median, so an entry for a peer that is not in the cluster shifts that
+// median and can commit on less than a majority.
+func TestUpdatePeerProgress_IgnoresUnknownPeer(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+
+	rn.UpdatePeerProgress(99, 500)
+
+	rn.mu.RLock()
+	_, present := rn.MatchIndex[99]
+	size := len(rn.MatchIndex)
+	rn.mu.RUnlock()
+
+	if present {
+		t.Fatal("recorded progress for a peer that is not in the cluster")
+	}
+	if size != 2 {
+		t.Fatalf("MatchIndex has %d entries, want 2 — an extra entry shifts the "+
+			"quorum median in AdvanceCommitIndex", size)
+	}
+}

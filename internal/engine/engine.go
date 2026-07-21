@@ -138,6 +138,13 @@ type Engine struct {
 	// election attempt and select on it so they cannot leak past shutdown.
 	done chan struct{}
 
+	// snapCache holds the last encoded snapshot, keyed by its boundary, so
+	// repeated rounds to a lagging follower do not re-read and re-encode it.
+	// Guarded by its own mutex: buildSnapshotRequest runs on replicator
+	// goroutines, not the control loop.
+	snapCacheMu sync.Mutex
+	snapCache   *encodedSnapshot
+
 	// fatalf halts the node on a condition from which it cannot continue
 	// correctly. It is a field only so tests can observe the halt instead of
 	// killing the test binary; in production it is log.Fatalf.
@@ -704,6 +711,14 @@ func (e *Engine) runElection() {
 	}
 }
 
+// encodedSnapshot is a snapshot already serialized for shipping, tagged with the
+// boundary it covers so a stale cache is detectable.
+type encodedSnapshot struct {
+	index int
+	term  int
+	data  []byte
+}
+
 // voteResult carries one RequestVote reply back to the control loop.
 // electionTerm is the term the vote was SOLICITED in, which is what makes a
 // late reply from an abandoned election identifiable and discardable.
@@ -847,6 +862,14 @@ func (e *Engine) reportHigherTerm(term int) {
 // replication goroutines: it only reads immutable snapshot state and node/log
 // accessors that take their own locks.
 func (e *Engine) buildSnapshotRequest() (raft.InstallSnapshotRequest, bool) {
+	// M4: reuse the cached encoding while the snapshot on disk is unchanged.
+	// Without this, every replication round to a lagging follower re-read and
+	// re-encoded the whole snapshot from disk — ten times a second per follower
+	// at the current heartbeat interval, for bytes that had not changed.
+	e.snapCacheMu.Lock()
+	cached := e.snapCache
+	e.snapCacheMu.Unlock()
+
 	snap, err := e.snapshots.Read()
 	if err != nil || snap == nil {
 		if err != nil {
@@ -855,11 +878,30 @@ func (e *Engine) buildSnapshotRequest() (raft.InstallSnapshotRequest, bool) {
 		return raft.InstallSnapshotRequest{}, false
 	}
 
+	if cached != nil && cached.index == snap.Meta.LastIncludedIndex &&
+		cached.term == snap.Meta.LastIncludedTerm {
+		return raft.InstallSnapshotRequest{
+			Term:              e.node.CurrentTerm(),
+			LeaderID:          e.node.NodeID(),
+			LastIncludedIndex: cached.index,
+			LastIncludedTerm:  cached.term,
+			Data:              cached.data,
+		}, true
+	}
+
 	data, err := snap.EncodeState()
 	if err != nil {
 		log.Printf("[ENGINE] Cannot encode snapshot for shipping: %v", err)
 		return raft.InstallSnapshotRequest{}, false
 	}
+
+	e.snapCacheMu.Lock()
+	e.snapCache = &encodedSnapshot{
+		index: snap.Meta.LastIncludedIndex,
+		term:  snap.Meta.LastIncludedTerm,
+		data:  data,
+	}
+	e.snapCacheMu.Unlock()
 
 	return raft.InstallSnapshotRequest{
 		Term:              e.node.CurrentTerm(),

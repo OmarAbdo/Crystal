@@ -95,5 +95,13 @@ func (c *Config) validate() error {
 	if c.DataDir == "" {
 		return fmt.Errorf("data-dir must not be empty")
 	}
+	// A node listed among its own peers inflates clusterSize on that node alone,
+	// so it computes a different majority from everyone else. Two nodes could
+	// then both believe they hold a quorum. This is a typo in a launch script,
+	// and it is silent — the cluster runs, incorrectly.
+	if addr, ok := c.Peers[c.NodeID]; ok {
+		return fmt.Errorf("node %d is listed in its own -peers as %q: peers must "+
+			"name only the OTHER cluster members", c.NodeID, addr)
+	}
 	return nil
 }

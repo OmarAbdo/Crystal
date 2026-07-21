@@ -239,6 +239,7 @@ func (rl *RaftLog) AppendEntriesToLog(prevLogIndex, prevLogTerm int, entries []L
 	}
 
 	// Steps 3 & 4: splice in the new entries, truncating only on a real conflict.
+	appended := 0
 	for _, entry := range entries {
 		existing, exists := rl.getEntryLocked(entry.Index)
 		switch {
@@ -255,13 +256,40 @@ func (rl *RaftLog) AppendEntriesToLog(prevLogIndex, prevLogTerm int, entries []L
 			}
 			fallthrough
 		default:
-			// Append the new entry (step 4).
-			if err := rl.writeEntryToDisk(entry); err != nil {
+			// M2: the cache is positional — cache[i] holds index firstIndex+i, and
+			// every index translation in this file depends on it. An append that
+			// does not continue the sequence would break that mapping silently, and
+			// from then on getEntryLocked returns the wrong entry for every index.
+			// The consistency check above should make this unreachable; if it is
+			// ever reached the log is not what we think it is, and continuing would
+			// corrupt it further.
+			if want := rl.firstIndex + len(rl.cache); entry.Index != want {
+				log.Printf("[WAL] refusing non-contiguous append: entry index %d, "+
+					"expected %d (firstIndex=%d, cached=%d)",
+					entry.Index, want, rl.firstIndex, len(rl.cache))
+				return 0, 0, 0, false
+			}
+
+			// M5: buffer the write; the batch is fsynced once below rather than
+			// once per entry.
+			if err := writeEntryTo(rl.walFile, entry); err != nil {
 				log.Printf("[WAL] append follower entry failed: %v", err)
 				return 0, 0, 0, false
 			}
 			rl.cache = append(rl.cache, entry)
 			rl.nextIndex = entry.Index + 1
+			appended++
+		}
+	}
+
+	// M5: one fsync for the whole batch. Durability is unchanged — nothing is
+	// acknowledged to the leader until this returns — but a 100-entry
+	// AppendEntries costs one sync instead of a hundred. This matters more since
+	// F1, because the node lock is held across this call.
+	if appended > 0 {
+		if err := rl.walFile.Sync(); err != nil {
+			log.Printf("[WAL] fsync after follower append failed: %v", err)
+			return 0, 0, 0, false
 		}
 	}
 

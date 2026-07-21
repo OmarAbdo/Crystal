@@ -195,6 +195,15 @@ func (rn *RaftNode) UpdatePeerProgress(peerID, matchIndex int) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	// M3: an unknown peer would create a map entry, and AdvanceCommitIndex counts
+	// one index per MatchIndex entry to find the quorum median. An extra entry
+	// shifts that median and can commit on less than a majority. Reject rather
+	// than silently growing the map.
+	if _, known := rn.MatchIndex[peerID]; !known {
+		log.Printf("[RAFT] ignoring progress from unknown peer %d", peerID)
+		return
+	}
+
 	if matchIndex > rn.MatchIndex[peerID] {
 		rn.MatchIndex[peerID] = matchIndex
 		log.Printf("[RAFT] Peer %d matchIndex → %d", peerID, matchIndex)

@@ -553,3 +553,64 @@ func TestGetEntriesFrom(t *testing.T) {
 		t.Fatalf("GetEntriesFrom past end = %v, want nil", got)
 	}
 }
+
+// ---- M2 / M5: cache invariant and batched durability ----
+
+// The cache is positional: cache[i] holds index firstIndex+i, and every index
+// translation in log.go depends on it. A non-contiguous append would break that
+// mapping silently — from then on getEntryLocked returns the wrong entry for
+// every index — so it is refused rather than accepted.
+func TestAppendEntriesToLog_RefusesNonContiguousAppend(t *testing.T) {
+	rl := newTestLog(t)
+	if _, err := rl.AppendLeader([]byte(`{"op":"noop"}`), 1); err != nil {
+		t.Fatalf("AppendLeader: %v", err)
+	}
+
+	// prevLogIndex 1 matches, but the batch skips index 2 entirely.
+	_, _, _, ok := rl.AppendEntriesToLog(1, 1, []LogEntry{
+		{Index: 5, Term: 1, Command: []byte(`{"op":"noop"}`)},
+	})
+	if ok {
+		t.Fatal("accepted an entry that leaves a hole in the log")
+	}
+	if got := rl.LatestIndex(); got != 1 {
+		t.Fatalf("LatestIndex = %d, want 1 — the log must be unchanged", got)
+	}
+}
+
+// A batch is durable as a whole before the follower acknowledges it; batching
+// the fsync changes the cost, not the guarantee.
+func TestAppendEntriesToLog_BatchSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch.wal")
+	rl, err := NewRaftLog(path)
+	if err != nil {
+		t.Fatalf("NewRaftLog: %v", err)
+	}
+
+	batch := make([]LogEntry, 0, 50)
+	for i := 1; i <= 50; i++ {
+		batch = append(batch, LogEntry{Index: i, Term: 2, Command: []byte(`{"op":"noop"}`)})
+	}
+	if _, _, _, ok := rl.AppendEntriesToLog(0, 0, batch); !ok {
+		t.Fatal("batch append failed")
+	}
+	if err := rl.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := NewRaftLog(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	if got := reopened.LatestIndex(); got != 50 {
+		t.Fatalf("recovered LatestIndex = %d, want 50", got)
+	}
+	for _, idx := range []int{1, 25, 50} {
+		e, ok := reopened.GetEntry(idx)
+		if !ok || e.Term != 2 {
+			t.Fatalf("entry %d missing or wrong after reopen: %+v ok=%v", idx, e, ok)
+		}
+	}
+}
