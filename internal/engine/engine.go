@@ -179,6 +179,12 @@ func NewWithTransport(
 		done:         make(chan struct{}),
 		fatalf:       log.Fatalf,
 	}
+	// Keep the §6 stickiness window aligned with our own election timing: the
+	// node ignores vote requests within one minimum election timeout of hearing
+	// from a live leader, and "minimum election timeout" has to mean the same
+	// thing on both sides.
+	node.SetMinElectionTimeout(electionTimeoutMin)
+
 	e.resetElectionTimeout()
 	return e
 }

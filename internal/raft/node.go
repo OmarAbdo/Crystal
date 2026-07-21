@@ -38,6 +38,11 @@ import (
 	"crystal/internal/fsutil"
 )
 
+// DefaultMinElectionTimeout is the §6 stickiness window used when the caller has
+// not set one. The engine overrides it with its own electionTimeoutMin so the
+// two cannot drift apart.
+const DefaultMinElectionTimeout = 300 * time.Millisecond
+
 // RaftNode holds the consensus state for one node.
 type RaftNode struct {
 	mu sync.RWMutex
@@ -61,6 +66,12 @@ type RaftNode struct {
 	lastContact  time.Time
 	votesGranted int
 
+	// minElectionTimeout is the §6 stickiness window: a RequestVote arriving
+	// within this long of hearing from a live leader is ignored outright, term
+	// and all. The engine owns the election timing and sets this to match its own
+	// electionTimeoutMin; the default keeps a bare RaftNode sensible in tests.
+	minElectionTimeout time.Duration
+
 	// Leader-only volatile state (reinitialized after each election, Figure 2).
 	// NextIndex is the index of the next log entry the leader will send to a
 	// peer (initialized to leader's lastIndex+1). MatchIndex is the highest
@@ -80,17 +91,18 @@ type RaftNode struct {
 // the majority threshold used for elections and commitment.
 func NewRaftNode(nodeID int, peerIDs []int, clusterSize int, metadataPath string, initialRole NodeRole) (*RaftNode, error) {
 	rn := &RaftNode{
-		nodeID:       nodeID,
-		peerIDs:      peerIDs,
-		clusterSize:  clusterSize,
-		Role:         initialRole,
-		LeaderID:     0, // unknown until we hear from a leader or win an election
-		CommitIndex:  0,
-		LastApplied:  0,
-		lastContact:  time.Now(),
-		NextIndex:    make(map[int]int),
-		MatchIndex:   make(map[int]int),
-		store:        fileStateStore{path: metadataPath},
+		nodeID:             nodeID,
+		peerIDs:            peerIDs,
+		clusterSize:        clusterSize,
+		Role:               initialRole,
+		LeaderID:           0, // unknown until we hear from a leader or win an election
+		CommitIndex:        0,
+		LastApplied:        0,
+		lastContact:        time.Now(),
+		minElectionTimeout: DefaultMinElectionTimeout,
+		NextIndex:          make(map[int]int),
+		MatchIndex:         make(map[int]int),
+		store:              fileStateStore{path: metadataPath},
 		persistent: PersistentState{
 			CurrentTerm: 0, // first boot; first election bumps to 1 (Figure 2)
 			VotedFor:    -1,
@@ -147,6 +159,18 @@ func (rn *RaftNode) State() (NodeRole, int) {
 // NodeID returns the immutable node identifier.
 func (rn *RaftNode) NodeID() int {
 	return rn.nodeID
+}
+
+// SetMinElectionTimeout sets the §6 stickiness window. The engine calls this so
+// the window matches the election timing it actually uses; a mismatch either
+// shields a dead leader for too long or leaves a live one unprotected.
+func (rn *RaftNode) SetMinElectionTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.minElectionTimeout = d
 }
 
 // CurrentLeader returns the ID of the leader this node last heard from, or 0 if
@@ -539,6 +563,30 @@ func (rn *RaftNode) HandleRequestVote(req RequestVoteRequest, lastLogState func(
 
 	// Step 1: reject a candidate from an older term.
 	if req.Term < rn.persistent.CurrentTerm {
+		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
+	}
+
+	// §6, final paragraph: "servers disregard RequestVote RPCs when they believe
+	// a current leader exists. Specifically, if a server receives a RequestVote
+	// RPC within the minimum election timeout of hearing from a current leader,
+	// it does not update its term or grant its vote."
+	//
+	// This is the paper's remedy for disruptive servers. A node that was briefly
+	// partitioned comes back with a term inflated by every election it held
+	// alone; without this check its first RequestVote drags the whole cluster up
+	// to that term and deposes a leader that was working perfectly. Note what is
+	// NOT done here: the term is not adopted. Replying with our own lower term is
+	// the entire point — acknowledging theirs is the disruption.
+	//
+	// The guard is deliberately narrow. It applies only when we know of a live
+	// leader (LeaderID != 0); a node that has merely granted a vote recently has
+	// no leader to protect and must stay free to vote again. And it lapses after
+	// one minimum election timeout, so a leader that has genuinely died stops
+	// being shielded and a real election proceeds.
+	if rn.LeaderID != 0 && time.Since(rn.lastContact) < rn.minElectionTimeout {
+		log.Printf("[RAFT] Node %d ignoring RequestVote from %d (term %d): heard from "+
+			"leader %d %v ago", rn.nodeID, req.CandidateID, req.Term,
+			rn.LeaderID, time.Since(rn.lastContact).Truncate(time.Millisecond))
 		return RequestVoteResponse{Term: rn.persistent.CurrentTerm, VoteGranted: false}
 	}
 

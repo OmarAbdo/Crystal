@@ -222,3 +222,18 @@ func TestControlLoopResponsiveDuringElection(t *testing.T) {
 		t.Fatalf("write to the new leader failed: %v", err)
 	}
 }
+
+// ---- F13/F20: disruption from a rejoining node ----
+
+// The check must not prevent legitimate elections: once the leader really is
+// gone, followers stop hearing from it, the stickiness window lapses, and a new
+// leader is elected normally.
+func TestStickinessDoesNotBlockRealElections(t *testing.T) {
+	c := New(t, Options{Size: 3})
+	leader := c.WaitLeader(5 * time.Second)
+
+	c.Isolate(leader.ID)
+
+	next := c.WaitLeaderAmong(c.Others(leader.ID), 5*time.Second)
+	t.Logf("leadership moved %d → %d despite the stickiness check", leader.ID, next.ID)
+}

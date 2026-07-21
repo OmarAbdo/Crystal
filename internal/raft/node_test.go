@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newTestNode(t *testing.T, nodeID int, peerIDs []int, clusterSize int) *RaftNode {
@@ -489,5 +490,84 @@ func TestBecomeFollower_SameTermSucceedsWithoutPersist(t *testing.T) {
 	}
 	if rn.persistent.VotedFor != 3 {
 		t.Fatalf("VotedFor = %d, want 3 preserved", rn.persistent.VotedFor)
+	}
+}
+
+// ---- F13: §6 leader stickiness ----
+
+// §6, final paragraph: "if a server receives a RequestVote RPC within the
+// minimum election timeout of hearing from a current leader, it does not update
+// its term or grant its vote."
+//
+// Both halves matter. Refusing the vote is the obvious part; refusing to adopt
+// the candidate's term is what actually protects the leader, because a term
+// bump is how a disruptive candidate deposes one.
+func TestHandleRequestVote_IgnoresCandidateWhileLeaderIsAlive(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+	rn.SetMinElectionTimeout(300 * time.Millisecond)
+
+	// A leader has just been heard from.
+	if err := rn.BecomeFollower(5, 2); err != nil {
+		t.Fatalf("BecomeFollower: %v", err)
+	}
+	rn.noteContact()
+
+	resp := rn.HandleRequestVote(RequestVoteRequest{
+		Term: 9, CandidateID: 3, LastLogIndex: 100, LastLogTerm: 9,
+	}, staticLogState(0, 0))
+
+	if resp.VoteGranted {
+		t.Fatal("granted a vote while a leader was known to be alive")
+	}
+	if resp.Term != 5 {
+		t.Fatalf("resp.Term = %d, want 5 — our own term, not the candidate's", resp.Term)
+	}
+	if rn.persistent.CurrentTerm != 5 {
+		t.Fatalf("CurrentTerm = %d, want 5 — adopting the candidate's term is the "+
+			"disruption the check exists to prevent", rn.persistent.CurrentTerm)
+	}
+}
+
+// Once the window lapses, a real election must be able to proceed.
+func TestHandleRequestVote_GrantsAfterStickinessWindowLapses(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+	rn.SetMinElectionTimeout(20 * time.Millisecond)
+
+	if err := rn.BecomeFollower(5, 2); err != nil {
+		t.Fatalf("BecomeFollower: %v", err)
+	}
+	rn.noteContact()
+	time.Sleep(40 * time.Millisecond) // leader has gone quiet
+
+	resp := rn.HandleRequestVote(RequestVoteRequest{
+		Term: 6, CandidateID: 3, LastLogIndex: 0, LastLogTerm: 0,
+	}, staticLogState(0, 0))
+
+	if !resp.VoteGranted {
+		t.Fatal("refused a vote after the stickiness window lapsed — a dead " +
+			"leader would be shielded forever")
+	}
+}
+
+// The window protects a LEADER, not a recent vote. A node that has only granted
+// a vote knows of no leader and must stay free to vote again in a later term,
+// or a split vote could never be resolved.
+func TestHandleRequestVote_StickinessDoesNotApplyWithoutAKnownLeader(t *testing.T) {
+	rn := newTestNode(t, 1, []int{2, 3}, 3)
+	rn.SetMinElectionTimeout(time.Second)
+
+	// Grant a vote — this refreshes lastContact but leaves LeaderID unset.
+	first := rn.HandleRequestVote(RequestVoteRequest{Term: 5, CandidateID: 2},
+		staticLogState(0, 0))
+	if !first.VoteGranted {
+		t.Fatal("first vote was not granted")
+	}
+
+	// A later term must still be considered, immediately.
+	second := rn.HandleRequestVote(RequestVoteRequest{Term: 6, CandidateID: 3},
+		staticLogState(0, 0))
+	if !second.VoteGranted {
+		t.Fatal("refused a higher-term vote with no leader known — stickiness " +
+			"must key on a live leader, not on any recent contact")
 	}
 }
