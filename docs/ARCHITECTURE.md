@@ -3,7 +3,9 @@
 This document is the guided tour. It explains how a write travels through the
 system, why the layers are drawn where they are, and how the concurrency model
 keeps consensus race-free. For the mapping to the Raft paper itself — the safety
-arguments, Figure 2 line by line — see **[RAFT.md](RAFT.md)**.
+arguments, Figure 2 line by line — see **[RAFT.md](RAFT.md)**. For the runtime in
+full detail — every goroutine, every channel, and who owns which field — see
+**[CONCURRENCY.md](CONCURRENCY.md)**.
 
 ---
 
